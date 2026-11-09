@@ -92,21 +92,59 @@ def uid_folders(uid: int, root: str = "/private/var/folders") -> Optional[list[s
 
 
 SF_NOUNLINK = 0x00100000      # <sys/stat.h>; macOS sets it (SIP-enforced) on its per-user folder skeleton
+# Inside a per-user folder: TCC Full Disk Access protected, no sunlnk; nobody without FDA can list them, root included
+TEMP_ITEMS = ("T/TemporaryItems", "T/com.apple.trustd/TemporaryItems")
 
 
-def removable_entries(roots: list, uid: int, lstat: Callable = os.lstat,
-                      listdir: Callable = os.listdir) -> Optional[list[str]]:
+class Unverified(str):
+    """A path removable_entries could not prove empty and that must never be offered to rm: a TemporaryItems folder
+    at its exact place that is not provably empty (the user restarts or uses Full Disk Access instead)."""
+
+
+class Uninspected(str):
+    """A folder of the per-user tree this process may not list (T and C are 0700 uid 470): not inspected, so never
+    "nothing removable". Only the root teardown, verified in the same run, can vouch for it."""
+
+
+def on_apfs(path: str, run: Optional[Callable] = None) -> bool:
+    """True if the file system holding `path` is APFS: df statfs(2)s the path and, with -T, prints it only if its type
+    is in the list (else nothing and exit 1); -Y adds the type column, checked too. Same check as the teardown."""
+    rc, out = (run or capsmod.run_cmd)(["/bin/df", "-P", "-Y", "-T", "apfs", path])
+    rows = out.splitlines()
+    return rc == 0 and len(rows) == 2 and rows[1].split()[1:2] == ["apfs"]
+
+
+def temporary_items_empty(p: str, st, uid: int, listdir: Callable, on_apfs: Callable[[str], bool]) -> bool:
+    """The teardown's emptiness proof for a TemporaryItems folder nobody can list (see teardown-bh-builder.sh): on
+    APFS a directory's st_size is 32 * (entries + 2) and st_nlink is entries + 2. Observed APFS behavior, not a
+    documented API, so only the exact shape macOS creates counts: a 0700 directory of uid:uid (the installer's group
+    has the same number), no flags, size 64, link count 2, a listing refused with EPERM, on APFS."""
+    import errno
+    import stat
+    if not (st.st_mode == stat.S_IFDIR | 0o700 and st.st_uid == uid and st.st_gid == uid and st.st_flags == 0
+            and st.st_size == 64 and st.st_nlink == 2):
+        return False
+    try:
+        listdir(p)
+    except OSError as e:
+        return e.errno == errno.EPERM and on_apfs(p)
+    return False
+
+
+def removable_entries(roots: list, uid: int, lstat: Callable = os.lstat, listdir: Callable = os.listdir,
+                      on_apfs: Callable[[str], bool] = on_apfs) -> Optional[list[str]]:
     """The top-most paths under `roots` (uid's per-user folders) that are not macOS's protected skeleton, which no
-    one can remove: directories owned by `uid` with SF_NOUNLINK, and data vaults inside them that the kernel will
-    not let anyone stat (EPERM). [] if only that skeleton is left; None if something could not be inspected.
-    lstat only: a symlink is reported, never followed. Run as the owner, folders only uid and root can read (T,
-    C: 0700) are not looked into; the root teardown checks them before it deletes the account, so the checklist
-    trusts this only once the account is gone."""
+    one can remove: directories owned by `uid` with SF_NOUNLINK, data vaults inside them that the kernel will not
+    let anyone stat (EPERM), and a TemporaryItems at exactly its place that is provably empty. A TemporaryItems there
+    that is not provably empty is returned as Unverified. [] if only that skeleton is left; None if something could
+    not be inspected. lstat only: a symlink is reported, never followed. Run as the owner, folders only uid and root
+    can read (T, C: 0700) cannot be looked into and are returned as Uninspected: the checklist accepts them only when
+    the root teardown verified them in the same run."""
     import errno
     import stat
     found: list[str] = []
 
-    def walk(p: str, top: bool) -> bool:
+    def walk(p: str, top: bool, root: str) -> bool:
         try:
             st = lstat(p)
         except FileNotFoundError:
@@ -114,14 +152,21 @@ def removable_entries(roots: list, uid: int, lstat: Callable = os.lstat,
         except OSError as e:
             return e.errno == errno.EPERM and not top
         if not (stat.S_ISDIR(st.st_mode) and st.st_uid == uid and st.st_flags & SF_NOUNLINK):
-            found.append(p)
+            if p in {f"{root}/{t}" for t in TEMP_ITEMS}:
+                if not temporary_items_empty(p, st, uid, listdir, on_apfs):
+                    found.append(Unverified(p))
+            else:
+                found.append(p)
             return True
         try:
             names = listdir(p)
         except OSError as e:
-            return e.errno == errno.EACCES
-        return all(walk(os.path.join(p, n), False) for n in sorted(names))
-    return found if all(walk(r, True) for r in roots) else None
+            if e.errno != errno.EACCES:
+                return False
+            found.append(Uninspected(p))
+            return True
+        return all(walk(os.path.join(p, n), False, root) for n in sorted(names))
+    return found if all(walk(r, True, r) for r in roots) else None
 
 
 def _unsafe_to_paste(word: str) -> bool:
@@ -144,6 +189,12 @@ def describe_unsafe(argv: list[str]) -> str:
     bad = [a for a in argv if _unsafe_to_paste(a)]
     return ("no command shown: a path in it contains control characters (" + ", ".join(ascii(a) for a in bad)
             + "); inspect it with ls -b and remove it by hand")
+
+
+def shown_path(p: str) -> str:
+    """A path for a note (not a command): shell-quoted so it reads as one word, escaped if it holds control
+    characters. Names under a per-user folder are chosen by build code."""
+    return ascii(p) if _unsafe_to_paste(p) else shlex.quote(p)
 
 
 def show(argv: list[str]) -> str:

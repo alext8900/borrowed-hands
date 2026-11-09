@@ -41,7 +41,12 @@ What this plugin does inside Hermes:
   Ed25519 server private key (`server_ed25519.key`, mode 0600) and its lock file, and a SQLite database
   (`bh.sqlite3`, mode 0600) holding paired Macs' public keys, pairing-code hashes (never the codes), signed job
   contracts, job results including compiler diagnostics, owner notices, an audit log, and the public repository
-  URL last named for each granted workspace.
+  URL last named for each granted workspace. The gateway process can read these files, so any route the agent has
+  to the gateway's files reaches them: a shell or file tool on the local terminal backend, and a chat reply. In
+  Hermes's default media mode, a reply with a `MEDIA:<path>` tag makes the gateway attach that file to the chat;
+  for the key, a reply that just names its absolute path is enough. Hermes's media, file-read and
+  dangerous-command checks do not cover `plugin-data`. Set `HERMES_MEDIA_DELIVERY_STRICT=1` on the gateway (see
+  [residual risks](#limits-and-residual-risks)).
 - **Reads outside its own data.** Its own settings from Hermes config, and the non-secret environment fallbacks
   `BH_LISTEN`, `BH_PORT`, `BH_PUBLIC_URL`, `RAILWAY_PUBLIC_DOMAIN`, `BH_OWNERS` and `BH_TRUSTED_PROXY`. It reads no
   secrets: no API keys, `.env` files, Hermes `auth.json`, keychains or other tools' logins.
@@ -86,9 +91,12 @@ What the separate Mac install does. It is not loaded by Hermes; its source is in
   and adds one syntax-checked sudoers drop-in file named `borrowed-hands`. That file authorizes your
   numeric uid for six exact dispatcher command lines as root: four timeout tiers (`300`, `900`, `1800`, `3600`)
   with this Mac's fixed disk/memory budgets, plus `--sweep-only` and `--cancel`. There are no wildcard argument
-  grants. At run time the helper calls `sudo -n` with only those command lines, and reads system facts with
-  `sw_vers`, `sysctl`, `scutil` and `xcodebuild -version`. `launchctl` installs its service. If you turn on
-  per-build confirmation, `osascript` shows a local dialog.
+  grants. Setup checks an installed rule by comparing its bytes with the expected rule using `cmp` under `sudo`.
+  At run time the helper calls `sudo -n` with only those command lines, and `sudo -n -l --` with each of them to
+  ask sudo whether it is permitted (permitted, not proven password-free). It reads system facts with `sw_vers`,
+  `sysctl`, `scutil`, `xcode-select -p`, `xcodebuild -version` and `xcodebuild -license check`. `launchctl`
+  installs its service. If you turn on per-build confirmation, `osascript` shows a local dialog. `bh uninstall`
+  also reads `dscl` records to verify the build user is gone.
 - **Long-running background processes.** The helper runs as you, as a user LaunchAgent. The dispatcher starts each
   build as a system LaunchDaemon running as `bh-builder`; git materialization and Xcode run under separate sandbox
   profiles. Repository-controlled code runs on the Mac only as build scripts and Swift compiler plugins (macros),
@@ -119,12 +127,45 @@ projects/schemes/configurations. Exact destinations are `platform=macOS,arch=arm
 `generic/platform=iOS Simulator`, with signing disabled. Simulator support is compile-only; no boot, install, UI
 or tests. Remote Swift packages are unsupported. One build runs with up to three queued per Mac.
 
-A stolen server signing key can request anything existing Mac grants allow; code running as the Mac user can
-read its key and alter grants. The hosting edge can observe result contents and disrupt service. Builds can read
-some host metadata. Diagnostics are untrusted compiler text; scrubbing is hygiene, not a security boundary.
+**Server key.** A leaked `server_ed25519.key` lets its holder sign contracts and frames for every paired Mac. To
+deliver them it also needs the Mac's connection: the Mac dials only its pinned `wss://` endpoint, verifies TLS
+and checks the pinned server key. The Mac still enforces its grants, so at most the holder gets what they allow:
+builds of granted `bh/*` commits and system info. A leak needs no access to the host: a prompt-injected reply
+that names the key's path (which is predictable) attaches the key in Hermes's default media mode, with no tool
+call and no approval. In a single-owner DM it lands in the owner's own chat, and the default terminal tool is
+already a stronger route to the file. In a group chat, or where terminal and file tools were turned off or moved
+to a non-local backend to keep the key out of reach, it is the main route.
+
+`HERMES_MEDIA_DELIVERY_STRICT=1` reduces this exposure without closing it. It limits attachments to Hermes's own
+trusted artifact directories (its caches and similar), `HERMES_MEDIA_ALLOW_DIRS`, and files modified within a
+recency window (600 seconds by default). The key is written once, so strict mode blocks it except: for the
+window after the key is created, including the new key made during recovery, or restored with a fresh
+modification time; and whenever an allowed directory contains it. `bh.sqlite3` and its `-wal`/`-shm` files can
+be attached within the window after a write, or from an allowed directory. They hold no private keys or tokens,
+but results, diagnostics, owner ids and the audit log can still be sensitive. Strict mode does not stop a shell
+or file tool. If the key leaks, see [If the server key leaks](#if-the-server-key-leaks).
+
+Code running as the Mac user can read its key and alter grants. The hosting edge can observe result contents and
+disrupt service. Builds can read some host metadata. Diagnostics are untrusted compiler text; scrubbing is
+hygiene, not a security boundary.
 Recorded completed compiles reported `cleanup_ok=true` and `wipe_ok=false`, including an unlink-protected empty
 trustd directory; full persistent-state removal is not established. See [protocol residual risks](../docs/PROTOCOL.md#8-residual-risks-accepted-for-01).
 No independent security review of 0.1 has been completed; this README makes no review or release-approval claim.
+
+### If the server key leaks
+
+`/hands rotate-key` is not available in 0.1. Re-pair instead:
+
+1. Run `bh unpair` on every Mac, while the gateway still runs (`/hands status` lists them). A Mac that has not
+   unpaired keeps trusting the leaked key.
+2. Stop the gateway and rename this plugin's directory under `$HERMES_HOME/plugin-data/`, adding a dated suffix
+   such as `.leaked-20261109T1530Z` so an earlier copy is never replaced. Never rename it under a running
+   gateway; on Railway, rename it at startup (see the quickstart). Renaming keeps the audit log in `bh.sqlite3`;
+   the plugin creates a new key and database on start.
+3. Start the gateway and check that the `listener up` log line shows a new server key id; if not, do not pair.
+   Then send `/hands pair` in a DM and run `bh setup` on each Mac. Pairing resets grants, so grant again. The
+   new key is attachable even in strict mode until it is older than the configured recency window (600 seconds
+   by default).
 
 ## Settings
 

@@ -507,9 +507,10 @@ Alex's sign-off. Hackathon scope: no negotiation.
 - **Server signing-key compromise.** Whoever holds `server_ed25519.key` (the Railway volume, or anyone with shell
   access to the deployment) can mint valid contracts and frames for every paired Mac. The Mac still enforces its
   grants, allowlists and the sandbox, so the attacker gets exactly what the grants allow: builds of granted
-  workspaces' commits that are on `bh/*` branches, captures if enabled, and system info. Mitigations: `/hands
-  rotate-key`, `bh unpair` on the Mac, and narrow grants. There is no revocation list for a stolen server key in 0.1;
-  rotation plus re-pairing is the response.
+  workspaces' commits that are on `bh/*` branches, captures if enabled, and system info. Mitigations: `bh unpair`
+  on every Mac, narrow grants, and `HERMES_MEDIA_DELIVERY_STRICT=1` on the gateway, which reduces chat delivery of
+  the key file (exceptions in the plugin README). There is no revocation list and `/hands rotate-key` is not
+  available in 0.1; re-pairing with a new key is the response (QUICKSTART.md "If the server key leaks").
 - **Same-user compromise on the Mac.** Malware running as the Mac's user can read the device key, edit `config.toml`
   grants and impersonate the helper. Out of scope; the sandbox protects the user from builds, not the other way round.
 - **Railway edge.** It cannot forge or replay frames (signatures, seq, sid, exp), but it can drop or delay them and

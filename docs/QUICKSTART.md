@@ -40,9 +40,23 @@ granted repository's branch list (anonymously) to find the latest `bh/` commit w
    | `TELEGRAM_BOT_TOKEN` | from @BotFather |
    | `TELEGRAM_ALLOWED_USERS` | your numeric Telegram user id |
    | `BH_OWNERS` | `telegram:<your numeric Telegram user id>` |
+   | `HERMES_MEDIA_DELIVERY_STRICT` | `1` (recommended; see below) |
 
    The image turns the listener on and derives the public URL (`wss://<your domain>/bh/v1/ws`) from Railway's
    domain. Set `BH_PUBLIC_URL` only to override it.
+
+   `HERMES_MEDIA_DELIVERY_STRICT=1` reduces the risk of a prompt-injected reply attaching the server key to the
+   chat. By default Hermes attaches files that a reply names with a `MEDIA:` tag or, for common file types
+   including `.key`, by bare absolute path, and the plugin's data directory is not on its denylist. Strict mode
+   only attaches files from Hermes's trusted artifact directories (its caches and similar),
+   `HERMES_MEDIA_ALLOW_DIRS`, and files modified within a recency window (600 seconds by default). The key is
+   written once, so strict mode blocks it except in the window after it is created (including a key made during
+   recovery) or restored with a fresh modification time, and whenever an allowed directory contains it. Keep
+   `/opt/data` and the plugin's data directory out of `HERMES_MEDIA_ALLOW_DIRS`. The job database (`bh.sqlite3`:
+   no private keys or tokens, but results, diagnostics and the audit log) can still be attached within the
+   window after a write, and strict mode does not limit the agent's terminal or file tools. It applies to every
+   file the gateway would attach, so an agent that sends files from other places needs them in
+   `HERMES_MEDIA_ALLOW_DIRS`.
 
 3. Deploy, then check: `curl https://<your domain>/bh/v1/healthz` prints `{"ok": true, "v": 1}`.
 
@@ -69,7 +83,11 @@ granted repository's branch list (anonymously) to find the latest `bh/` commit w
 3. Put a TLS reverse proxy in front: `https://hermes.example.com/bh/v1/` must reach `127.0.0.1:8790` with WebSocket
    upgrades allowed on `/bh/v1/ws`. The plugin itself speaks plain HTTP; `public_url` only tells Macs where to
    connect, it does not create the endpoint.
-4. Restart `hermes gateway run`. The listener only starts in the gateway process. Check
+4. Recommended: set `HERMES_MEDIA_DELIVERY_STRICT=1` in the gateway's environment (or `gateway: {strict: true}` in
+   `config.yaml`). It blocks the server key only once the key is older than the configured recency window (600
+   seconds by default) and while no allowed directory contains it. It gives the job database no confidentiality
+   guarantee and does not limit the terminal and file tools. Option A has the exact conditions.
+5. Restart `hermes gateway run`. The listener only starts in the gateway process. Check
    `curl https://hermes.example.com/bh/v1/healthz`.
 
 More operator detail (all settings, logs, failure table): [operator reference](INSTALL.md).
@@ -213,7 +231,8 @@ bh uninstall
 Answer `y`. It stops the background helper first and waits (up to about two minutes) for a running build to stop.
 If the helper is still running, for example `bh run` in another terminal, it removes nothing else and asks you to
 stop it and run `bh uninstall` again. Otherwise it unpairs (telling the server when it can reach it), removes the
-build sandbox, the `bh-builder` user and the sudo rule, then **checks each item** and prints a checklist:
+sudo rule (first, so nothing can start a new build while the build user is checked and removed; if that fails it
+stops there), then the build sandbox and the `bh-builder` user, then **checks each item** and prints a checklist:
 
 - `ok`: verifiably gone.
 - `LEFT`: still there, with the exact command that removes it.
@@ -223,11 +242,65 @@ Any `LEFT` or `UNKNOWN` item makes the command exit nonzero. The teardown only r
 group, home and caches it can verify are Borrowed Hands' own (uid and gid 470 with the attributes setup gives
 them). If another account already uses uid 470 or that home, its data is left in place and reported.
 
-Once the build user has run a build, macOS keeps a few empty per-user folders for it under `/private/var/folders`
-that carry a system flag (`sunlnk`) not even root can override. The teardown removes everything else in them and
-the checklist shows these as `ok` with a `left by macOS` note: there is nothing to do, and `rm` cannot remove them.
-After the account is deleted they show owner `470` instead of `bh-builder`; macOS removes or reuses them. When it
-reports `Uninstalled and verified`, finish with:
+Once the build user has run a build, macOS keeps a per-user folder for it under `/private/var/folders`. The
+teardown removes everything it can in that folder. Only two kinds of entry may stay, and only when they are
+verified empty:
+
+- Folders that carry a system flag (`sunlnk`) not even root can override, and a system data vault inside them.
+- The two `TemporaryItems` folders, `T/TemporaryItems` and `T/com.apple.trustd/TemporaryItems`. macOS protects
+  them with Full Disk Access, so nobody can list them, root included. The teardown checks them from their
+  metadata instead: on APFS an empty directory reads size 64 and link count 2, and each entry adds 32 bytes and
+  one link. That is observed APFS behavior, not a documented interface, so the teardown accepts it only for a
+  directory at exactly that place, owned by 470:470, mode 0700, with no flags, whose listing is refused with
+  "Operation not permitted", on an APFS volume. It then tries `rmdir`; if macOS refuses, the empty folder stays.
+  On a real Mac (macOS 27.2) root read exactly that shape for both folders, its listing was refused with exactly
+  that error, and the teardown reported both as verified empty.
+
+The checklist shows these folders as `ok` with a `left by macOS` note: there is nothing to do, and `rm` cannot remove them.
+After the account is deleted they show owner `470` instead of `bh-builder`. The checklist runs as you, and you
+cannot look inside `T` and `C` (only uid 470 and root can), so it relies on the teardown for them: it shows `ok`
+only when the teardown verified them in the same `bh uninstall` run. If the account was already gone before the
+run, for example deleted by hand, nothing verified them, and the checklist shows `UNKNOWN` with a `sudo ls -laO`
+command to look. Rerunning `bh uninstall` will not change that line, and the command still exits nonzero. If the
+listing shows only macOS's protected folders, there is nothing to remove. If it shows anything else, run
+`bh setup`: it checks them as root before it creates `bh-builder` and prints the one safe removal command
+(described below).
+
+Deleting the account itself can stall. Observed on macOS 27.2, with the cause not proven: a per-user `distnoted`
+process running as uid 470 appeared the moment `dscl . -delete /Users/bh-builder` started, launchd restarted it
+when it was killed, and the delete hung until opendirectoryd gave up after about five minutes ("ODRecordDelete
+... forcing a timeout") and `dscl` failed with DS Error -14987 (eUndefinedError). With uid 470's processes stopped
+first, the delete finished in 37 seconds. So, only after it has verified the account is ours, the teardown boots
+out uid 470's launchd domains, kills its processes and waits until none are left, then deletes the account with a
+two-minute limit. If that fails it first checks whether the account is gone anyway (opendirectoryd can finish a
+delete after `dscl` gave up; only a listing that works and no longer shows `bh-builder` counts), and otherwise
+stops the processes again and retries once. If the retry also fails, it keeps the account and
+`/opt/borrowed-hands`, exits nonzero and says that opendirectoryd timed out the delete; run `bh uninstall` again
+later. On the same Mac, with this change and a uid 470 `distnoted` still lingering, `bh uninstall` finished in 34
+seconds with every checklist line `ok`, and a later `bh setup` passed its check of the folder the removed account
+had left behind.
+
+If a `TemporaryItems` folder cannot be verified empty (it has entries, or any of the checks above fails), the
+teardown fails closed: it keeps the `bh-builder` account and `/opt/borrowed-hands`, exits nonzero and prints the
+recovery path. Restart the Mac (macOS clears these temporary folders at startup), then run `bh uninstall` again
+before deleting anything by hand. If it still cannot be verified, temporarily give your Terminal Full Disk Access
+(System Settings > Privacy & Security > Full Disk Access), rerun `bh uninstall`, then remove that access. Never
+give Full Disk Access to `/bin/sh`, `bh-runner` or `bh-dispatch`: builds would then be able to read your protected
+data.
+
+Reinstalling reuses uid 470. macOS names the per-user folder after the account's generated UUID as well as its
+uid, and setup never sets that UUID, so a new `bh-builder` gets a new folder. The old folder stays, owned by uid
+470, and the new account could open anything in it by path. Before it creates the account, setup therefore checks
+every folder under `/private/var/folders` owned by uid 470, read-only and by the same rules, and installs nothing
+if one is not verifiably the empty protected skeleton. It then prints how to recover: restart and run `bh setup`
+again; if that does not help (macOS clears these folders at startup for existing accounts, and whether it does so
+for a deleted account is not verified), give your Terminal Full Disk Access, run the `sudo rm -rf` command setup
+prints, remove that access and run `bh setup` again. That command names only the per-user folder itself, single
+quoted, and only when its name has the form macOS generates. Names inside the folder were chosen by build code, so
+setup and the teardown print them only escaped, in diagnostics, and never in a command; do not paste one after
+`rm`.
+
+When it reports `Uninstalled and verified`, finish with:
 
 ```sh
 uv tool uninstall borrowed-hands-helper
@@ -264,6 +337,41 @@ line by hand.
    delete the whole `plugin-data` directory; other plugins keep their data there. Remove the reverse-proxy route to
    port 8790, then start the gateway again.
 4. Revoke any bot token or provider key you created only for this deployment.
+
+## If the server key leaks
+
+`/hands rotate-key` is not available in 0.1. Re-pair instead:
+
+1. **Unpair every Mac first.** `/hands status` lists them. Run `bh unpair` on each Mac while the gateway still
+   runs, so the server records it. A Mac that has not unpaired keeps trusting the leaked key. Note the current
+   key id from the gateway log line `borrowed_hands: listener up on ... (server key <id>)`.
+2. **Move the plugin's data aside** (rename it rather than delete it, so the audit log in `bh.sqlite3` is kept).
+   Its directory is `$HERMES_HOME/plugin-data/agent-plugin-borrowed-hands-<eight hex characters>`. Add a suffix
+   with the date and time, for example `.leaked-20261109T1530Z`, so an earlier recovery's copy is never replaced.
+   - Existing Hermes: stop the gateway, rename the directory, start the gateway.
+   - Railway: the gateway is the container's main process, so a `railway ssh` shell cannot stop it, and
+     renaming the directory under a running gateway can break its open database. Rename it at startup instead,
+     before the gateway starts. Railway never runs two deployments of a service with a volume at the same time,
+     so the old gateway has stopped by then. In the service settings, set the custom start command to the line
+     below, with `L=` set to a new suffix for this recovery:
+
+     ```sh
+     /bin/sh -c "L=leaked-20261109T1530Z; P=/opt/data/plugin-data/agent-plugin-borrowed-hands-; for d in $P????????; do [ -d $d ] || continue; if [ -e $d.$L ]; then [ -e $d/server_ed25519.key ] || continue; a=$(cat $d/server_ed25519.key) && b=$(cat $d.$L/server_ed25519.key) && [ X$a != X ] && [ X$b != X ] && [ X$a != X$b ] || { echo 'bh-recovery: cannot confirm the live key differs from the moved key; not starting' >&2; exit 1; }; else mv $d $d.$L || { echo 'bh-recovery: rename failed; not starting' >&2; exit 1; }; fi; done; ls -d $P????????.$L >/dev/null 2>&1 || { echo 'bh-recovery: no plugin data was moved; not starting' >&2; exit 1; }; exec /opt/bh/bh-start.sh gateway run"
+     ```
+
+     and deploy. The command refuses to start the gateway if the rename fails, if there was nothing to move, or
+     if a copy with this suffix exists and it cannot read both keys and confirm they differ. A restart after the first successful boot keeps the
+     new key, because the copy with this suffix already exists. For the same reason, a suffix reused from an
+     earlier recovery looks like a restart and moves nothing; the key id check in step 3 catches that. Remove
+     the custom start command right after that first successful boot. **This recipe has not been tested on
+     Railway.** It was run only locally, against a fake `/opt/data` with a stand-in for the startup script, so
+     Railway's handling of the command and the full container start are unverified. Watch the deploy logs. The
+     startup script keeps what is in `plugin-data`: it never replaces or deletes the plugin's key or database.
+3. **Check the key changed, then pair again.** On start the plugin creates a new key and an empty database. The
+   `listener up` log line must show a different server key id from the one you noted; if it does not, stop and
+   do not pair. Then send `/hands pair` in your DM and run `bh setup` on each Mac. Pairing resets grants, so
+   grant again. Even in strict mode the new key can be attached to a chat until it is older than the configured
+   recency window (600 seconds by default).
 
 ## Troubleshooting
 

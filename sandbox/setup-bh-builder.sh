@@ -33,6 +33,37 @@ if [ "${1:-}" = --check-home ]; then   # test hook: run only claim_dir on a give
   claim_dir "$2" 0; exit $?
 fi
 
+# --- per-user folders left by an earlier install (numeric uid reuse). macOS names a user's /private/var/folders
+# folder after its GeneratedUID and uid. This script never sets GeneratedUID (and must never adopt or reset an old
+# one), so a new bh-builder gets a new folder, but the old one stays, owned by uid 470, and any uid-470 process can
+# reach what is in it by path. Before creating the account, refuse unless each such folder is verifiably the empty
+# protected skeleton, by the teardown's own rules (sourcing it only defines functions). Read-only: nothing is removed.
+# Skipped when bh-builder exists (its folder is in use) or another account holds uid 470 (refused below).
+if ! dscl . -read /Users/$U >/dev/null 2>&1 &&
+   ! dscl . -list /Users UniqueID | awk -v id=$ID '{ for (i = 2; i <= NF; i++) if ($i == id) f = 1 } END { exit !f }'; then
+  # shellcheck source-path=SCRIPTDIR source=teardown-bh-builder.sh disable=SC1091
+  source "$SRC/teardown-bh-builder.sh"
+  caches_cleared 0 || {
+    echo "uid $ID's per-user folders under /private/var/folders, left by an earlier Borrowed Hands install, could not" \
+      "be verified empty; a new bh-builder would get uid $ID again and could reach them, so nothing was installed." \
+      "Restart this Mac, then run 'bh setup' again before deleting anything by hand (macOS clears temporary folders" \
+      "at startup for existing accounts; whether it also clears the folder of a deleted account is not verified)." >&2
+    # The only path ever put in a command here is the per-user folder itself, and only when its name is one macOS
+    # generates (two and thirty characters of its base32 alphabet), so the quoted word cannot hold anything a build
+    # chose. Names inside it are build-chosen: they appear above only as escaped diagnostics.
+    a='[0-9_bcdfghjklmnpqrstvwxyz]'
+    if [[ $CHECKED_ROOT =~ ^/private/var/folders/$a{2}/$a{30}$ ]]; then
+      echo "If it still cannot be verified, temporarily give your Terminal Full Disk Access (System Settings >" \
+        "Privacy & Security > Full Disk Access), run: sudo rm -rf '$CHECKED_ROOT' (macOS keeps its protected" \
+        "folders; this removes what the earlier install left), then remove that access and run 'bh setup' again." >&2
+    else
+      echo "If it still cannot be verified, inspect /private/var/folders by hand: no command is shown because the" \
+        "folder could not be named safely." >&2
+    fi
+    exit 1
+  }
+fi
+
 # --- group
 if dscl . -read /Groups/$U >/dev/null 2>&1; then
   [ "$(dscl . -read /Groups/$U PrimaryGroupID | awk '{print $2}')" = $ID ] || { echo "group $U exists with wrong gid" >&2; exit 1; }

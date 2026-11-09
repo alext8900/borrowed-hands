@@ -223,7 +223,12 @@ interface check. The self-test is local; the end-to-end check is a build request
 See the [complete checklist](QUICKSTART.md#uninstall). In short: `bh uninstall` on the Mac (it stops the helper
 first and removes nothing while one still runs, verifies each removal, and lists anything left or uncheckable with
 the exact command; the empty, macOS-protected per-user folders under `/private/var/folders`, owned by uid 470 once
-the account is gone, are reported as `ok` with a note because nobody can remove them), then
+the account is gone, are reported as `ok` with a note because nobody can remove them, but only when the teardown
+verified them in the same run; otherwise they are `UNKNOWN`, since you cannot look inside them. Their `TemporaryItems`
+folders cannot be listed even by root, so their emptiness is checked from size and link count on APFS; if that
+check fails, the account and `/opt/borrowed-hands` are kept and it tells you to restart and rerun, or to give your
+Terminal Full Disk Access for one rerun. A reinstall reuses uid 470, so `bh setup` checks those old folders first
+and refuses if they are not verifiably empty), then
 `uv tool uninstall borrowed-hands-helper`; on Hermes,
 `/hands unpair` each Mac, then delete the Railway service and volume, or stop the gateway and remove the plugin and
 only its own data directory.

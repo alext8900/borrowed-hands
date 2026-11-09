@@ -450,6 +450,16 @@ def test_plugin_readme_carries_the_rule_13_disclosures():
         assert needle in text, needle
 
 
+def test_rotate_key_reply_gives_the_re_pair_recipe(monkeypatch):
+    from types import SimpleNamespace as NS
+    from borrowed_hands import commands, runtime
+    monkeypatch.setattr(runtime, "RT", NS(settings=NS(is_owner=lambda *_: True)))
+    text = commands.handle("rotate-key")                      # source None: the local CLI owner
+    assert "`bh unpair`" in text and "every Mac first" in text
+    assert "plugin-data" in text and "audit log" in text and "/hands pair" in text
+    assert "delete server_ed25519.key" not in text
+
+
 def test_reply_of_the_wrong_kind_does_not_consume_the_request(srv):
     async def go():
         h = await paired(srv)

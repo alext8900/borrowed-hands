@@ -328,6 +328,32 @@ def test_uninstall_clean_mac_prints_a_checklist_and_succeeds(tmp_path):
     assert not w.env.home.exists()
 
 
+def test_the_sudo_rule_is_removed_before_the_teardown(tmp_path):
+    # Security review round 1 P3: while the rule exists any admin-user process can start a uid-470 build, which could write into
+    # TemporaryItems between the teardown's emptiness proof and the account's deletion
+    w = uninstall_world(tmp_path)
+    bh(w, "uninstall")
+    rule = ["/bin/rm", "-f", *cli.SUDOERS_FILES]
+    assert w.sudo_calls.index(rule) < w.sudo_calls.index(TEARDOWN), w.sudo_calls
+
+
+def test_a_failed_rule_removal_skips_the_teardown_and_fails(tmp_path):
+    # a rule that may still be in place keeps that window open: do not judge the caches under it
+    w = uninstall_world(tmp_path)
+    real = w._sudo
+
+    def sudo(argv):
+        if argv[:2] == ["/bin/rm", "-f"]:
+            w.sudo_calls.append(argv)
+            return 1
+        return real(argv)
+    w.env.sudo = sudo
+    rc = bh(w, "uninstall")
+    text = w.text()
+    assert rc == 1 and TEARDOWN not in w.sudo_calls, text
+    assert any(l.startswith("  LEFT ") and "teardown" in l and "not run" in l for l in w.out), text
+
+
 def test_uninstall_reports_leftovers_with_exact_commands_and_fails(tmp_path):
     w = uninstall_world(tmp_path)
     w.left |= {"/opt/borrowed-hands", "/etc/sudoers.d/borrowed-hands"}
@@ -602,6 +628,10 @@ class FakeTree:
         v = self.tree.get(p, errno.ENOENT)
         if isinstance(v, int):
             raise OSError(v, os.strerror(v), p)
+        if len(v) == 6:                                      # (st_mode, uid, gid, flags, size, nlink), verbatim
+            mode, uid, gid, flags, size, nlink = v
+            return SimpleNamespace(st_mode=mode, st_uid=uid, st_gid=gid, st_flags=flags, st_size=size,
+                                   st_nlink=nlink)
         mode, uid, flags = v
         return SimpleNamespace(st_mode=mode | (st.S_IFDIR if mode == 0o755 else st.S_IFREG if mode == 0o644
                                                 else st.S_IFLNK), st_uid=uid, st_flags=flags)
@@ -620,17 +650,185 @@ REAL = {SKEL: (D, 470, NOUNLINK), f"{SKEL}/0": (D, 470, NOUNLINK), f"{SKEL}/0/co
         f"{SKEL}/T": (D, 470, NOUNLINK), f"{SKEL}/C": (D, 470, NOUNLINK), f"{SKEL}/X": (D, 470, NOUNLINK)}
 
 
-def removable(tree, unlistable=()):
+def removable(tree, unlistable=(), apfs=True):
     from borrowed_hands_helper.env import removable_entries
     t = FakeTree(tree, unlistable)
-    return removable_entries([SKEL], 470, lstat=t.lstat, listdir=t.listdir), t
+    return removable_entries([SKEL], 470, lstat=t.lstat, listdir=t.listdir, on_apfs=lambda p: apfs), t
+
+
+# ---- TemporaryItems: the same emptiness proof as the root teardown (see test_teardown.py). Run as the admin user T
+# is normally unreadable (EACCES) so this rarely sees one, but when it does it must agree with the teardown.
+TI, TTI = f"{SKEL}/T/TemporaryItems", f"{SKEL}/T/com.apple.trustd/TemporaryItems"
+DIR700 = 0o040700
+EMPTY_TI = (DIR700, 470, 470, 0, 64, 2)
+TCC = {TI: errno.EPERM, TTI: errno.EPERM}
+WITH_TI = {**REAL, f"{SKEL}/T/com.apple.trustd": (D, 470, NOUNLINK), TI: EMPTY_TI, TTI: EMPTY_TI}
+
+
+def test_removable_entries_accepts_verified_empty_temporary_items():
+    res, t = removable(WITH_TI, TCC)
+    assert res == [] and TI in t.listed and TTI in t.listed
+
+
+def _ti(**kw):
+    vals = dict(zip(("mode", "uid", "gid", "flags", "size", "nlink"), EMPTY_TI))
+    vals.update(kw)
+    return tuple(vals.values())
+
+
+@pytest.mark.parametrize("entry,unlistable,apfs,why", [
+    (_ti(size=96), TCC, True, "size 96"),
+    (_ti(nlink=3), TCC, True, "nlink 3"),
+    (_ti(mode=0o040755), TCC, True, "mode 0755"),
+    (_ti(mode=0o041700), TCC, True, "sticky"),
+    (_ti(uid=501), TCC, True, "owner 501"),
+    (_ti(gid=20), TCC, True, "group 20"),
+    (_ti(flags=0x2), TCC, True, "uchg"),
+    (_ti(mode=0o120700), TCC, True, "symlink"),
+    (EMPTY_TI, {TI: errno.EACCES}, True, "ls EACCES"),
+    (EMPTY_TI, {TI: errno.ENOENT}, True, "ls ENOENT"),
+    (EMPTY_TI, {}, True, "listable"),
+    (EMPTY_TI, TCC, False, "not APFS"),
+])
+def test_removable_entries_marks_unprovable_temporary_items_unverified(entry, unlistable, apfs, why):
+    from borrowed_hands_helper.env import Unverified
+    res, _ = removable({**REAL, TI: entry}, unlistable, apfs)
+    assert res == [TI] and isinstance(res[0], Unverified), (why, res)
+
+
+@pytest.mark.parametrize("path", [f"{SKEL}/T/TemporaryItems2", f"{SKEL}/C/TemporaryItems", f"{SKEL}/TemporaryItems"])
+def test_a_temporary_items_elsewhere_is_an_ordinary_leftover(path):
+    from borrowed_hands_helper.env import Unverified
+    res, _ = removable({**REAL, path: EMPTY_TI}, {path: errno.EPERM})
+    assert res == [path] and not isinstance(res[0], Unverified), res
+
+
+def test_on_apfs_reads_the_df_type_filter():
+    from borrowed_hands_helper.env import on_apfs
+    row = "Filesystem Type 512-blocks Used Available Capacity Mounted on\n/dev/disk3s5 apfs 8 4 4 50% /\n"
+    calls = []
+
+    def run(rc, out):
+        return lambda argv: (calls.append(argv), (rc, out))[1]
+    assert on_apfs("/p", run=run(0, row)) and calls[-1] == ["/bin/df", "-P", "-Y", "-T", "apfs", "/p"]
+    assert not on_apfs("/p", run=run(1, ""))                                       # filtered out: not APFS
+    assert not on_apfs("/p", run=run(1, row))                                      # df failed
+    assert not on_apfs("/p", run=run(0, row.replace(" apfs ", " hfs ")))           # -T ignored
+    assert not on_apfs("/p", run=run(0, row.splitlines()[0] + "\n"))               # no row
+    assert not on_apfs("/p", run=run(0, row + row.splitlines()[1] + "\n"))         # two rows
+
+
+def test_unverified_temporary_items_are_left_with_the_recovery_path_not_rm(tmp_path):
+    from borrowed_hands_helper.env import Unverified
+    from test_teardown import RECOVERY
+    w = uninstall_world(tmp_path)
+    w.caches, w.cache_left = [SKEL], [Unverified(TI)]
+    rc = bh(w, "uninstall")
+    line = next(l for l in w.out if "build user caches" in l)
+    assert rc == 1 and line.startswith("  LEFT ") and RECOVERY in line and TI in line, line
+    assert "rm -rf" not in line and "sudo" not in line, line
+    w.cache_left = [Unverified(TI), f"{SKEL}/X/leftover"]                         # never rm next to it either
+    bh(w, "uninstall")
+    line = [l for l in w.out if "build user caches" in l][-1]
+    assert RECOVERY in line and "rm -rf" not in line, line
+
+
+@pytest.mark.parametrize("name", ["x ~", "y $(touch pwned)", "z *", "q'uote", "~", "s;rm -rf ~"])
+def test_checklist_never_prints_a_path_unquoted(tmp_path, name):
+    # Security review round 1 P1: build-chosen names in rm commands are quoted; paths in notes are quoted too
+    from borrowed_hands_helper.env import Unverified
+    hostile = f"{SKEL}/X/{name}"
+
+    def caches_line(i, caches, left):
+        w = uninstall_world(tmp_path / str(i))
+        w.caches, w.cache_left = caches, left
+        bh(w, "uninstall")
+        return next(l for l in w.out if "build user caches" in l)
+    line = caches_line(0, [SKEL], [hostile])
+    assert shlex.split(step_of(line)) == ["sudo", "rm", "-rf", hostile], line
+    line = caches_line(1, [SKEL], [Unverified(hostile)])
+    assert shlex.quote(hostile) in line and f" {hostile})" not in line, line
+    root = f"/private/var/folders/xq/{name}"
+    line = caches_line(2, [root], [])
+    assert line.startswith("  ok ") and shlex.quote(root) in line, line
+
+
+def _uninspected_world(tmp_path, user_before: bool, teardown_rc: int = 0):
+    from borrowed_hands_helper.env import Uninspected
+    w = uninstall_world(tmp_path)
+    w.caches = [SKEL]
+    w.cache_left = [Uninspected(f"{SKEL}/C"), Uninspected(f"{SKEL}/T")]
+    if user_before:
+        w.loaded.add("/Users/bh-builder")
+    real = w._sudo
+
+    def sudo(argv):
+        if argv == TEARDOWN:
+            w.sudo_calls.append(argv)
+            w.loaded.discard("/Users/bh-builder")         # (with rc 0: verified the caches, then deleted it)
+            return teardown_rc
+        return real(argv)
+    w.env.sudo = sudo
+    return w
+
+
+def test_folders_nobody_inspected_are_unknown_not_ok(tmp_path):
+    # Security review round 1 P2: bh-builder was already gone (hand dscl -delete, an older release), so no teardown looked inside
+    # T and C in this run; the admin user cannot either
+    w = _uninspected_world(tmp_path, user_before=False)
+    rc = bh(w, "uninstall")
+    line = next(l for l in w.out if "build user caches" in l)
+    assert rc == 1 and line.startswith("  UNKNOWN "), line
+    assert "left by macOS" not in line and "nothing removable" not in line, line
+    check = line.split("look with: ", 1)[1].split("; ", 1)[0]
+    assert shlex.split(check) == ["sudo", "ls", "-laO", f"{SKEL}/C", f"{SKEL}/T"], line
+    assert "Uninstalled and verified" not in w.text()
+    # Security review round 2 P3: every rerun ends here, so say so, and say what does end it
+    assert "rerunning 'bh uninstall' will not change this line" in line, line
+    assert "'bh setup'" in line and "QUICKSTART" in line, line
+    footer = " ".join(w.errs)
+    assert "will not change" in footer and "run 'bh uninstall' again" not in footer, footer
+    assert "uv tool uninstall borrowed-hands-helper" in footer, footer
+
+
+def test_a_rerun_dead_end_does_not_hide_items_a_rerun_can_fix(tmp_path):
+    w = _uninspected_world(tmp_path, user_before=False)
+    w.left.add("/opt/borrowed-hands")
+    rc = bh(w, "uninstall")
+    footer = " ".join(w.errs)
+    assert rc == 1 and "run 'bh uninstall' again" in footer and "stay UNKNOWN" in footer, footer
+
+
+def test_folders_the_teardown_verified_in_this_run_are_ok(tmp_path):
+    w = _uninspected_world(tmp_path, user_before=True)
+    rc = bh(w, "uninstall")
+    line = next(l for l in w.out if "build user caches" in l)
+    assert rc == 0 and line.startswith("  ok ") and "left by macOS" in line, (line, w.text())
+    assert "verified by the teardown in this run" in line, line
+
+
+def test_a_failed_teardown_does_not_vouch_for_the_folders(tmp_path):
+    w = _uninspected_world(tmp_path, user_before=True, teardown_rc=1)     # even if the account is gone afterwards
+    rc = bh(w, "uninstall")
+    line = next(l for l in w.out if "build user caches" in l)
+    assert rc == 1 and line.startswith("  UNKNOWN "), line
+
+
+def test_checklist_recovery_text_matches_the_teardown():
+    from test_teardown import RECOVERY
+    assert cli.RECOVERY == RECOVERY
 
 
 def test_removable_entries_accepts_only_the_protected_skeleton():
-    # T and C are 0700 to everyone but uid 470 and root: unreadable here, checked by the root teardown
+    # T and C are 0700 to everyone but uid 470 and root: unreadable here. Security review round 1 P2: that is "not inspected",
+    # never "nothing removable"; only the root teardown, in the same run, can vouch for them
+    from borrowed_hands_helper.env import Uninspected
     unreadable = {f"{SKEL}/T": errno.EACCES, f"{SKEL}/C": errno.EACCES}
-    assert removable(REAL, unreadable)[0] == []
-    assert removable({**REAL, f"{SKEL}/X/f": (F, 470, 0)}, unreadable)[0] == [f"{SKEL}/X/f"]
+    res = removable(REAL, unreadable)[0]
+    assert res == [f"{SKEL}/C", f"{SKEL}/T"] and all(isinstance(p, Uninspected) for p in res), res
+    res = removable({**REAL, f"{SKEL}/X/f": (F, 470, 0)}, unreadable)[0]
+    assert res == [f"{SKEL}/C", f"{SKEL}/T", f"{SKEL}/X/f"] and not isinstance(res[2], Uninspected), res
+    assert removable(REAL)[0] == []                                          # everything listable and protected
     assert removable({**REAL, f"{SKEL}/X/d": (D, 470, 0), f"{SKEL}/X/d/f": (F, 470, 0)})[0] == [f"{SKEL}/X/d"]
     assert removable({**REAL, f"{SKEL}/X/u": (D, 501, NOUNLINK)})[0] == [f"{SKEL}/X/u"]       # not uid 470's
     assert removable({**REAL, SKEL: (D, 470, 0)})[0] == [SKEL]                                # the root has no flag

@@ -18,7 +18,7 @@ from typing import Optional
 from . import __version__, account, config, keyfile
 from ._shared import SANDBOX
 from .config import ACTIONS, ConfigError, Workspace
-from .env import Env, describe_unsafe, paste_command, show
+from .env import Env, Uninspected, Unverified, describe_unsafe, paste_command, show, shown_path
 from .jobstore import JobStore
 
 DB = "jobs.sqlite3"
@@ -229,6 +229,12 @@ BUILDER_HOME = "/Users/Shared/.bh-builder-home"
 BUILDER_UID = 470
 RUNNER_JOB = "system/com.borrowedhands.runner"
 LOGS = "~/Library/Logs/BorrowedHands"
+NO_RERUN = "rerunning 'bh uninstall' will not change this line"
+# Same text as the teardown's RECOVERY. Never Full Disk Access for /bin/sh, bh-runner or bh-dispatch.
+RECOVERY = ("Restart this Mac (macOS clears these temporary folders at startup), then run 'bh uninstall' again "
+            "before deleting anything by hand. If it still cannot be verified, temporarily give your Terminal Full "
+            "Disk Access (System Settings > Privacy & Security > Full Disk Access), rerun 'bh uninstall', then "
+            "remove that access.")
 
 
 def cmd(argv: list[str], sudo: bool = False) -> str:
@@ -236,11 +242,12 @@ def cmd(argv: list[str], sudo: bool = False) -> str:
     return paste_command(argv, sudo) or describe_unsafe(argv)
 
 
-def uninstall_checklist(env: Env) -> list[tuple[str, str, str]]:
+def uninstall_checklist(env: Env, caches_verified: bool = False) -> list[tuple[str, str, str]]:
     """(what, state, next step) for everything Borrowed Hands puts on this Mac, checked after removal so a success
     report is a verified one (audit #6). state is "ok" (verifiably gone), "ok-note" (only what macOS keeps and
     nobody can remove is left; the step is the note), "LEFT" (still there) or "UNKNOWN" (the check itself failed,
-    which never counts as removed)."""
+    which never counts as removed). caches_verified: the root teardown, in this run, verified uid 470's per-user
+    folders (it succeeded on a bh-builder account that existed when it started)."""
     from . import service
     teardown = cmd(["bash", str(SANDBOX / "teardown-bh-builder.sh")], sudo=True)
     agent = f"gui/{env.uid}/{service.LABEL}"
@@ -290,9 +297,28 @@ def uninstall_checklist(env: Env) -> list[tuple[str, str, str]]:
         removable = env.cache_removable(found, BUILDER_UID)
         if removable is None:
             return "UNKNOWN", f"could not check what is left in them; check with: {cmd(['ls', '-lRO', *found], True)}"
+        # T and C are 0700: this process cannot look inside. Only the root teardown can, and it vouches for them
+        # only by succeeding in this same run on an account it verified as ours (it exits 1 otherwise).
+        uninspected = [p for p in removable if isinstance(p, Uninspected)]
+        removable = [p for p in removable if not isinstance(p, Uninspected)]
+        if not removable and uninspected and not caches_verified:
+            # Fail closed, but not a loop: the teardown looks inside only while the account exists, so no rerun can
+            # settle this; say what does.
+            return "UNKNOWN", (f"only root can look inside {', '.join(map(shown_path, uninspected))}, and the "
+                               f"bh-builder account was already gone, so no teardown can verify them: {NO_RERUN}; "
+                               f"look with: {cmd(['ls', '-laO', *uninspected], True)}; if that shows only macOS's "
+                               f"protected folders there is nothing to remove. Otherwise run 'bh setup': it checks "
+                               f"them as root before it creates bh-builder again and prints the one safe removal "
+                               f"command (docs/QUICKSTART.md, Uninstall)")
         if not removable:
-            return "ok-note", (f"left by macOS (protected per-user folders, nothing removable left): "
-                               f"{', '.join(found)}; macOS removes or reuses these; nothing to do")
+            return "ok-note", (f"left by macOS (protected per-user folders, nothing removable left"
+                               f"{', verified by the teardown in this run' if uninspected else ''}): "
+                               f"{', '.join(map(shown_path, found))}; they stay owned by uid {BUILDER_UID} and setup "
+                               f"checks them before it creates bh-builder again; nothing to do")
+        unverified = [p for p in removable if isinstance(p, Unverified)]
+        if unverified:      # TCC-protected TemporaryItems not provably empty: never an rm next to it
+            return "LEFT", (f"{RECOVERY} (could not verify that these protected TemporaryItems folders are empty: "
+                            f"{', '.join(map(shown_path, unverified))})")
         # The account is gone, so the teardown can no longer authorize this; names below T/ were chosen by build
         # code, so the command is quoted, or not shown at all for a name with control characters.
         return "LEFT", cmd(["rm", "-rf", *removable], sudo=True)
@@ -316,19 +342,26 @@ def uninstall_checklist(env: Env) -> list[tuple[str, str, str]]:
     ]
 
 
-def _report(env: Env, steps: tuple = ()) -> int:
+def _report(env: Env, steps: tuple = (), caches_verified: bool = False) -> int:
     """`steps`: (what, state, next step) for each admin command that ran. A failed one stays LEFT even when every
     inspected path is gone: the teardown also cleans what the checklist cannot see (uid 470's caches)."""
-    checklist = uninstall_checklist(env) + list(steps)
+    checklist = uninstall_checklist(env, caches_verified) + list(steps)
     env.say("Removal check:")
     for what, state, step in checklist:
         env.say(f"  ok      {what}" if state == "ok" else f"  ok      {what}; {step}" if state == "ok-note" else
                 f"  LEFT    {what}; remove it with: {step}" if state == "LEFT" else f"  UNKNOWN {what}; {step}")
     left = [c for c in checklist if c[1] not in ("ok", "ok-note")]
+    stuck = [c for c in left if NO_RERUN in c[2]]       # no rerun can settle these (see caches() in the checklist)
+    if left and len(stuck) == len(left):
+        env.err(f"{len(left)} item(s) could not be checked, and rerunning 'bh uninstall' will not change that (see "
+                f"the note above). Everything else is verified removed. You can finish with: uv tool uninstall "
+                f"borrowed-hands-helper; if you install again, 'bh setup' checks these folders first.")
+        return 1
     if left:
         env.err(f"{len(left)} item(s) remain or could not be checked. Run the commands shown, or fix the error "
                 f"above and run 'bh uninstall' again. Keep the helper installed until this passes: the teardown "
-                f"script ships with it.")
+                f"script ships with it." + (" The build user caches line will stay UNKNOWN on reruns (see its "
+                                            "note); the others can clear." if stuck else ""))
         return 1
     env.say(f"Uninstalled and verified. Logs are kept in {LOGS} (delete with: rm -rf {LOGS}). "
             f"Finish with: uv tool uninstall borrowed-hands-helper")
@@ -382,12 +415,22 @@ def cmd_uninstall(env: Env) -> int:
             env.err(f"  local pairing state is damaged ({e}); deleting it anyway")
         except OSError as e:          # e.g. an immutable key or job database: report it, keep cleaning up (R5)
             env.err(f"  could not remove part of the local pairing state ({e}); continuing")
-    # Keep going after a failure: removing the sudo rule is still right if the sandbox teardown failed, and the
-    # checklist below reports whatever is left.
+    # The sudo rule goes first: while it exists any process running as this user can start a uid-470 build, which
+    # could write into the build user's folders between the teardown's checks and the account's deletion. If it
+    # cannot be removed, the teardown is not run (that window would stay open); the checklist reports both.
     steps = []
-    for argv, why, done in ((["bash", str(SANDBOX / "teardown-bh-builder.sh")], "removing the build user and sandbox",
-                             "teardown of the build user, home, caches and sandbox finished"),
-                            (["/bin/rm", "-f", *SUDOERS_FILES], "removing the sudo rule", "sudo rule removal finished")):
+    # The teardown verifies uid 470's per-user folders only on an account that exists when it starts (and exits 1 if
+    # it cannot); with the account already gone it never looks, so its success then says nothing about them.
+    rc, out = env.run(["/usr/bin/dscl", ".", "-list", "/Users"])
+    user_before = rc == 0 and "bh-builder" in out.split()
+    caches_verified = False
+    for argv, why, done in ((["/bin/rm", "-f", *SUDOERS_FILES], "removing the sudo rule", "sudo rule removal finished"),
+                            (["bash", str(SANDBOX / "teardown-bh-builder.sh")], "removing the build user and sandbox",
+                             "teardown of the build user, home, caches and sandbox finished")):
+        if argv[0] == "bash" and any(s[1] != "ok" for s in steps):
+            steps.append(("teardown of the build user, home, caches and sandbox not run (the sudo rule could not be "
+                          "removed)", "LEFT", show(argv)))
+            break
         env.say(f"  {why}:")
         env.say(f"  $ {show(argv)}")
         rc = env.sudo(argv)
@@ -395,8 +438,10 @@ def cmd_uninstall(env: Env) -> int:
             env.err("  that command failed; see the checklist below")
         steps.append((done if rc == 0 else f"{done.rsplit(' finished', 1)[0]} failed (exit {rc}; see its message above)",
                       "ok" if rc == 0 else "LEFT", show(argv)))
+        if argv[0] == "bash":
+            caches_verified = user_before and rc == 0
     shutil.rmtree(env.home, ignore_errors=True)
-    return _report(env, tuple(steps))
+    return _report(env, tuple(steps), caches_verified)
 
 
 def main(argv: Optional[list] = None, env: Optional[Env] = None) -> int:

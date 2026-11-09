@@ -46,8 +46,10 @@ def handle(raw_args: str, source: Any = None, **_) -> Optional[str]:
     if sub == "unpair":
         return _unpair(rt, " ".join(parts[1:]).strip())
     if sub == "rotate-key":
-        return ("Server key rotation is not available in 0.1. If you think the server key leaked, run `bh unpair` "
-                "on each Mac, delete server_ed25519.key from the plugin data dir, restart the gateway and pair again.")
+        return ("Server key rotation is not available in 0.1. If you think the server key leaked: run `bh unpair` "
+                "on every Mac first, then stop the gateway, rename this plugin's directory under "
+                "$HERMES_HOME/plugin-data (that keeps the audit log), start the gateway, and pair each Mac again "
+                "with /hands pair and `bh setup`.")
     return USAGE
 
 

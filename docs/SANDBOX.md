@@ -305,8 +305,11 @@ Real example (compile error test):
 - **bh-dispatch:** runs as root, but its sweeps run in a forked child that first calls `setgroups([])`,
   `setgid(470)` and `setuid(470)`, then calls the same function. The kernel therefore can't let it signal
   anything but uid 470.
-- **teardown-bh-builder.sh:** runs `pkill -9 -u 470` only inside `sudo -u bh-builder sh -c`, after checking
-  both `id -u` and `id -ru` are 470.
+- **teardown-bh-builder.sh:** first sweeps with `bh-dispatch --sweep-only` (as uid 470, above). Then, only after
+  verifying that uid 470 belongs to our `bh-builder` and to no other account, and right before deleting that
+  account, root boots out the `user/470` (and `gui/470`) launchd domains and runs `pkill -KILL -U 470` until
+  `pgrep -U 470` finds nothing. A per-user `distnoted` otherwise stalled the delete on a real Mac (see
+  QUICKSTART, Uninstall).
 - **Tests:** `run-tests.sh` keeps a uid-501 sentinel process alive across the guard, timeout, cancel and
   probe-suite steps, and asserts it survives each one (it does). It also runs the kill function as uid 501
   and asserts that it is a no-op.
