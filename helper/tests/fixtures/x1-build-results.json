@@ -1,0 +1,38 @@
+{
+  "actionTitle" : "Build \"Probe\"",
+  "analyzerWarningCount" : 0,
+  "analyzerWarnings" : [
+
+  ],
+  "destination" : {
+    "architecture" : "arm64",
+    "deviceId" : "00006000-0014448A0A92401E",
+    "deviceName" : "My Mac",
+    "modelName" : "MacBook Pro",
+    "osBuildNumber" : "26B123",
+    "osVersion" : "27.2",
+    "platform" : "macOS"
+  },
+  "endTime" : 1793858935.606,
+  "errorCount" : 2,
+  "errors" : [
+    {
+      "className" : "DVTTextDocumentLocation",
+      "issueType" : "Swift Compiler Error",
+      "message" : "Cannot convert value of type 'String' to specified type 'Int'",
+      "sourceURL" : "file:///tmp/bh-capture/scratchpad/probes-xcode/proj/Sources/Greeting.swift#EndingColumnNumber=41&EndingLineNumber=0&StartingColumnNumber=41&StartingLineNumber=0&Timestamp=815551734.381233"
+    },
+    {
+      "className" : "DVTTextDocumentLocation",
+      "issueType" : "Swift Compiler Error",
+      "message" : "Cannot find 'undefinedThing' in scope",
+      "sourceURL" : "file:///tmp/bh-capture/scratchpad/probes-xcode/proj/Sources/Greeting.swift#EndingColumnNumber=56&EndingLineNumber=0&StartingColumnNumber=56&StartingLineNumber=0&Timestamp=815551734.381233"
+    }
+  ],
+  "startTime" : 1793858934.376,
+  "status" : "failed",
+  "warningCount" : 0,
+  "warnings" : [
+
+  ]
+}

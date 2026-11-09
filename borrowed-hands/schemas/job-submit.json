@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://borrowed-hands.dev/protocol/v1/job-submit.json",
+  "title": "job.submit body",
+  "type": "object",
+  "properties": {
+    "contract": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "sig": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{86}$"
+    }
+  },
+  "required": [
+    "contract",
+    "sig"
+  ],
+  "additionalProperties": false
+}

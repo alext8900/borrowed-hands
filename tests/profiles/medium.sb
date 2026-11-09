@@ -1,0 +1,8 @@
+(version 1)
+;; The feasibility-run profile (the original builder.sb from the feasibility run), with bh-runner's params.
+(allow default)
+(deny network*)
+(deny file-write*)
+(allow file-write* (subpath (param "JOB")) (subpath (param "USER_TMP")) (subpath (param "USER_CACHE"))
+  (literal "/dev/null") (literal "/dev/tty") (literal "/dev/dtracehelper") (regex #"^/dev/fd/") (regex #"^/dev/tty"))
+(deny file-read* (subpath (string-append (param "BUILDER_HOME") "/.ssh")) (subpath (string-append (param "BUILDER_HOME") "/Library/Keychains")))

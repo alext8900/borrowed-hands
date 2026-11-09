@@ -1,0 +1,55 @@
+name: Hog
+options:
+  bundleIdPrefix: com.example.bhprobe
+  deploymentTarget:
+    macOS: "14.0"
+targets:
+  Hog:
+    type: tool
+    platform: macOS
+    sources: [Sources]
+    settings:
+      base:
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        SWIFT_VERSION: "5.0"
+    preBuildScripts:
+      - name: HogScript
+        script: |
+          # Resource hog for the budget tests: the mode comes from a file in the commit.
+          case "$(cat "$SRCROOT/hog-mode" 2>/dev/null)" in
+            disk) mkdir -p "$DERIVED_FILE_DIR"; /bin/dd if=/dev/zero of="$DERIVED_FILE_DIR/hog.bin" bs=1048576 count=3072 2>&1 | tail -1; sleep 30 ;;
+            mem)  /usr/bin/perl -e '$x = "a" x (1536*1024*1024); sleep 60' ;;
+            unlinked) /usr/bin/perl -e 'open(my $f, ">", "$ENV{TARGET_TEMP_DIR}/hog-unlinked") or die; unlink "$ENV{TARGET_TEMP_DIR}/hog-unlinked"; my $b = "\0" x 1048576; for (1..3072) { print $f $b } $f->flush; sleep 120' ;;
+            forkbomb)
+              # fork up to 2000 sleeping children; RLIMIT_NPROC (plist) must stop it near 256
+              /usr/bin/perl -e 'my $n = 0; for (1..2000) { my $p = fork; last unless defined $p; if (!$p) { sleep 600; exit 0 } $n++ } open(my $o, ">>", "$ENV{SRCROOT}/forkbomb.out"); print $o "forked=$n\n"; close $o; sleep 600' ;;
+            fds)
+              # 3 processes x 10000 opens; RLIMIT_NOFILE (plist) must stop each near 1024
+              for i in 1 2 3; do
+                /usr/bin/perl -e 'my @f; for (1..10000) { open(my $h, "<", "/dev/null") or last; push @f, $h } my $n = @f; splice(@f, -8); open(my $o, ">>", "$ENV{SRCROOT}/fds.out"); print $o "opened=$n\n"; close $o; sleep 600' &
+              done
+              wait ;;
+            immutable)
+              # try to make 600 MB undeletable: chflags uchg (sandbox denies) and chmod 000 (allowed,
+              # but cleanup restores modes first). Then let the build finish normally.
+              D="$SRCROOT/../tmp/imm"; mkdir -p "$D/deep/er"
+              /bin/dd if=/dev/urandom of="$D/deep/er/big.bin" bs=1048576 count=600 2>/dev/null
+              /usr/bin/chflags uchg "$D/deep/er/big.bin" && echo "chflags_uchg=ok" >> "$SRCROOT/immutable.out" || echo "chflags_uchg=DENIED" >> "$SRCROOT/immutable.out"
+              /usr/bin/chflags uchg "$D" && echo "chflags_uchg_dir=ok" >> "$SRCROOT/immutable.out" || echo "chflags_uchg_dir=DENIED" >> "$SRCROOT/immutable.out"
+              /bin/chmod 000 "$D/deep/er" "$D/deep" "$D" && echo "chmod_000=ok" >> "$SRCROOT/immutable.out" ;;
+            freezer)
+              # only SIGSTOP the runner (allow-all control): the dispatcher alone must end the job
+              /bin/kill -STOP "$(cat "$SRCROOT/../tmp/.bh-runner-pid")" && echo "freezer_stopped=ok" >> "$SRCROOT/freezer.out"
+              sleep 600 ;;
+            stopper)
+              # try to freeze or kill the runner (and with it the runner-side budget checks), then hog.
+              # (results go to a file: phase output is only flushed to the log when the phase ends)
+              R=$(cat "$SRCROOT/../tmp/.bh-runner-pid")
+              echo "BH-STOPPER runner_pid=$R" >> "$SRCROOT/stopper.out"
+              /bin/kill -STOP "$R" && echo "BH-STOPPER kill_stop_runner=ok" >> "$SRCROOT/stopper.out" || echo "BH-STOPPER kill_stop_runner=DENIED" >> "$SRCROOT/stopper.out"
+              /usr/bin/pkill -STOP -f libexec/bh-runner && echo "BH-STOPPER pkill_stop_runner=ok" >> "$SRCROOT/stopper.out" || echo "BH-STOPPER pkill_stop_runner=DENIED" >> "$SRCROOT/stopper.out"
+              /bin/kill -KILL "$R" && echo "BH-STOPPER kill_kill_runner=ok" >> "$SRCROOT/stopper.out" || echo "BH-STOPPER kill_kill_runner=DENIED" >> "$SRCROOT/stopper.out"
+              sleep 3   # give the test time to copy stopper.out before the job (and src/) can end
+              /usr/bin/perl -e 'open(my $f, ">", "$ENV{TARGET_TEMP_DIR}/hog-unlinked") or die; unlink "$ENV{TARGET_TEMP_DIR}/hog-unlinked"; my $b = "\0" x 1048576; for (1..3072) { print $f $b } $f->flush; sleep 120' ;;
+          esac
+        basedOnDependencyAnalysis: false

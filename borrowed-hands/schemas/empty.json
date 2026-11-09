@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://borrowed-hands.dev/protocol/v1/empty.json",
+  "title": "body of ack and unpair",
+  "type": "object",
+  "properties": {},
+  "required": [],
+  "additionalProperties": false
+}

@@ -1,0 +1,19 @@
+name: MacroProbe
+# Confinement probe for macro plugins. The project loads its own "macro plugin" (probe-plugin.sh, a
+# shell script swift-frontend launches like any executable plugin). The script never answers the
+# compiler, so the build always fails; what matters is what the script could do while running.
+# With SWIFTC_DISABLE_SANDBOX=YES the compiler no longer wraps plugins in its own sandbox, so the
+# plugin must still be held by builder.sb, which every process in the build inherits.
+# Regenerate with: xcodegen generate --spec tests/macro-probe-app/project.yml --project tests/macro-probe-app
+options:
+  deploymentTarget:
+    macOS: '15.0'
+targets:
+  MacroProbe:
+    type: tool
+    platform: macOS
+    sources: [Sources]
+    settings:
+      base:
+        SWIFT_VERSION: '6.0'
+        OTHER_SWIFT_FLAGS: '-load-plugin-executable $(SRCROOT)/probe-plugin.sh#ProbeMacros'

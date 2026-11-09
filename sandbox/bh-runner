@@ -1,0 +1,1038 @@
+#!/usr/bin/python3 -I
+"""bh-runner: run one Borrowed Hands Xcode build job as the bh-builder user.
+
+Usage (as bh-builder, e.g. via `sudo -n -u bh-builder /path/to/bh-runner <job-dir> < job.json`):
+    bh-runner [--allow-file-remote] [--profile PATH] [--timeout SECS] <job-dir>
+
+<job-dir> must be exactly JOBS_ROOT/<job_id> (a lowercase uuid4). If it does not exist, the runner
+creates it (mode 700) and reads job.json from stdin; if it exists it must hold only job.json.
+job.json was validated by the caller; the runner validates it again, strictly:
+
+    {"v": 1, "job_id": "<uuid4>", "remote": "https://host/path.git", "commit": "<40 hex>",
+     "project": "App.xcodeproj" | "App.xcworkspace", "scheme": "App", "configuration": "Debug",
+     "destination": "platform=macOS,arch=arm64"}
+
+The runner materializes the exact commit with a hardened git recipe, runs xcodebuild inside
+sandbox-exec with fixed argv, extracts `xcresulttool get build-results`, prints ONE JSON object on
+stdout, and on every exit path (success, failure, timeout, SIGTERM/SIGINT/SIGHUP) kills every other
+process owned by bh-builder by explicit pid (proc_listpids(PROC_UID_ONLY, 470), SIGSTOP then SIGKILL;
+never pid -1 or a process group; refuses unless getuid() == geteuid() == 470)
+(the runner never calls launchctl: bh-dispatch owns the launchd side). One job at a time is enforced with a lock.
+
+stdlib only; runs on /usr/bin/python3.
+"""
+import fcntl
+import ipaddress
+import json
+import os
+import re
+import shutil
+import socket
+import signal
+import stat
+import subprocess
+import sys
+import time
+import urllib.parse
+
+BUILDER_USER = "bh-builder"
+BUILDER_UID = 470
+BUILDER_HOME = "/Users/Shared/.bh-builder-home"
+JOBS_ROOT = BUILDER_HOME + "/jobs"
+DEVELOPER_DIR = "/Applications/Xcode.app/Contents/Developer"
+XCODEBUILD = DEVELOPER_DIR + "/usr/bin/xcodebuild"
+XCRESULTTOOL = DEVELOPER_DIR + "/usr/bin/xcresulttool"
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+GIT = DEVELOPER_DIR + "/usr/bin/git"
+HERE = os.path.dirname(os.path.realpath(__file__))
+DEFAULT_PROFILE = os.path.join(HERE, "builder.sb")
+GIT_PROFILE = os.path.join(HERE, "git.sb")
+DESTINATION = "platform=macOS,arch=arm64"
+DEFAULT_TIMEOUT = 900
+MAX_TIMEOUT = 3600
+MAX_JOB_JSON = 16384
+LOG_TAIL_BYTES = 4000
+MAX_ERRORS = 50
+DEFAULT_DISK_BUDGET_MB = 20 * 1024     # job dir + per-user T/C; the job fails past this
+MAX_DISK_BUDGET_MB = 100 * 1024
+DEFAULT_MEM_BUDGET_MB = 6 * 1024       # summed RSS of every uid-470 process (8 GB test Mac)
+MAX_MEM_BUDGET_MB = 64 * 1024
+BUDGET_POLL_S = 3.0
+
+NUM_RE = re.compile(r"[0-9]{1,7}")      # ASCII digits only ("5²".isdigit() is True)
+UUID4_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9 ._+-]{0,63}$")
+PROJECT_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9 ._+/-]{0,199}\.(xcodeproj|xcworkspace)$")
+NUMERIC_LABEL_RE = re.compile(r"^(0x[0-9a-f]*|[0-9]+)$", re.I)
+SAFE_PATH_RE = re.compile(r"^/private/var/folders/[A-Za-z0-9_+./-]+$")
+HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,62})(\.[A-Za-z0-9]([A-Za-z0-9-]{0,62}))+$")
+URLPATH_RE = re.compile(r"^/[A-Za-z0-9._~/-]{1,300}$")
+JOB_KEYS = {"v", "job_id", "remote", "commit", "project", "scheme", "configuration", "destination", "allowed_refs"}
+ALLOWED_REFS = "refs/heads/bh/*"        # the only value 0.1 accepts
+BH_PREFIX = "refs/heads/bh/"
+BH_LOCAL = "refs/remotes/origin/bh/"
+MAX_DEP_FILES = 20
+MAX_SCAN_ENTRIES = 200000
+MAX_SCAN_FILE = 8 * 1024 * 1024
+MAX_WARNINGS = 50
+
+
+class JobError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def trace(msg):
+    """Stage timings to stderr (launchd puts it in <job-dir>/runner.err)."""
+    sys.stderr.write("%.2f %s\n" % (time.monotonic(), msg))
+    sys.stderr.flush()
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj, sort_keys=True) + "\n")
+    sys.stdout.flush()
+
+
+# ---------------------------------------------------------------- validation
+
+def validate_job_dir(arg):
+    if not isinstance(arg, str) or "\x00" in arg:
+        raise JobError("invalid_job", "bad job-dir")
+    if not arg.startswith(JOBS_ROOT + "/"):
+        raise JobError("invalid_job", "job-dir must be under %s" % JOBS_ROOT)
+    job_id = arg[len(JOBS_ROOT) + 1:]
+    if not UUID4_RE.match(job_id):
+        raise JobError("invalid_job", "job-dir basename must be a lowercase uuid4")
+    # Every component of JOBS_ROOT must be a real directory (no symlinks) and the root must be ours.
+    for path in (BUILDER_HOME, JOBS_ROOT):
+        st = os.lstat(path)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != BUILDER_UID or (st.st_mode & 0o077):
+            raise JobError("invalid_job", "%s must be a bh-builder-owned 0700 directory" % path)
+    if os.path.realpath(arg) != arg:
+        raise JobError("invalid_job", "job-dir must be a canonical path")
+    return job_id
+
+
+def resolve_public(host):
+    """Every address the host resolves to must be globally routable: no loopback, RFC1918,
+    link-local (incl. 169.254.169.254), CGNAT 100.64/10, ULA, multicast, unspecified, reserved.
+    Resolution failure is a rejection (fail closed). Note: git resolves again later (gap: DNS
+    rebinding between this check and the fetch; see docs/SANDBOX.md)."""
+    try:
+        infos = socket.getaddrinfo(host, 443, 0, socket.SOCK_STREAM)
+    except (OSError, UnicodeError) as e:
+        raise JobError("invalid_job", "remote host does not resolve: %s" % type(e).__name__)
+    addrs = set()
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        except ValueError:
+            raise JobError("invalid_job", "remote host resolved to an unparseable address")
+        if isinstance(ip, ipaddress.IPv6Address):
+            # 6to4 (2002::/16), Teredo (2001::/32) and NAT64 (64:ff9b::/96) carry an IPv4 address
+            # that would be reached through a relay: refuse those prefixes outright.
+            for net in ("2002::/16", "2001::/32", "64:ff9b::/96", "64:ff9b:1::/48"):
+                if ip in ipaddress.ip_network(net):
+                    raise JobError("invalid_job", "remote host resolves to a tunnelled/translated address (%s)" % ip)
+            if ip.ipv4_mapped is not None:
+                ip = ip.ipv4_mapped
+        if (not ip.is_global or ip.is_multicast or ip.is_loopback or ip.is_link_local or ip.is_private
+                or ip.is_unspecified or ip.is_reserved or ip in ipaddress.ip_network("100.64.0.0/10")):
+            raise JobError("invalid_job", "remote host resolves to a non-public address (%s)" % ip)
+        addrs.add(str(ip))
+    if not addrs:
+        raise JobError("invalid_job", "remote host has no addresses")
+    return sorted(addrs)
+
+
+def validate_remote(remote, allow_file, resolve=True):
+    if not isinstance(remote, str) or len(remote) > 400 or any(c in remote for c in "\x00\n\r \t\\"):
+        raise JobError("invalid_job", "bad remote")
+    try:
+        u = urllib.parse.urlsplit(remote)
+        host, port = u.hostname, u.port          # .port raises ValueError for e.g. 99999
+        user, pw = u.username, u.password
+    except Exception:
+        raise JobError("invalid_job", "unparseable remote URL")
+    if u.scheme == "https":
+        if user is not None or pw is not None or u.query or u.fragment or port not in (None, 443):
+            raise JobError("invalid_job", "https remote must have no userinfo, port, query or fragment")
+        if not HOST_RE.match(host or "") or not URLPATH_RE.match(u.path) or ".." in u.path:
+            raise JobError("invalid_job", "bad https remote host or path")
+        # No numeric-looking hosts at all (127.1, 0x7f.0.0.1, 10.1, 169.254.169.254, 1.2.3.4).
+        if any(NUMERIC_LABEL_RE.match(label) for label in host.split(".")):
+            raise JobError("invalid_job", "remote host must be a DNS name, not an address")
+        if resolve:
+            resolve_public(host)
+        return remote
+    if u.scheme == "file" and allow_file:
+        if u.netloc or not u.path.startswith("/") or ".." in u.path or not URLPATH_RE.match(u.path):
+            raise JobError("invalid_job", "bad file remote")
+        return remote
+    raise JobError("invalid_job", "remote must be https://" + (" or file://" if allow_file else ""))
+
+
+def parse_job_json(raw):
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception:  # UnicodeDecodeError, ValueError, RecursionError (deep nesting)
+        raise JobError("invalid_job", "job.json is not valid JSON")
+
+
+def validate_job(job, job_id, allow_file):
+    if not isinstance(job, dict) or set(job) != JOB_KEYS:
+        raise JobError("invalid_job", "job.json must have exactly keys %s" % sorted(JOB_KEYS))
+    if job["v"] != 1:
+        raise JobError("invalid_job", "unsupported v")
+    if job["allowed_refs"] != ALLOWED_REFS:
+        raise JobError("invalid_job", "allowed_refs must be exactly %s" % ALLOWED_REFS)
+    if job["job_id"] != job_id:
+        raise JobError("invalid_job", "job_id does not match job-dir")
+    validate_remote(job["remote"], allow_file)
+    if not isinstance(job["commit"], str) or not SHA_RE.match(job["commit"]):
+        raise JobError("invalid_job", "commit must be 40 lowercase hex")
+    p = job["project"]
+    if not isinstance(p, str) or not PROJECT_RE.match(p) or any(seg in ("", ".", "..") for seg in p.split("/")):
+        raise JobError("invalid_job", "project must be a relative .xcodeproj/.xcworkspace path")
+    for k in ("scheme", "configuration"):
+        if not isinstance(job[k], str) or not NAME_RE.match(job[k]):
+            raise JobError("invalid_job", "bad %s" % k)
+    if job["destination"] not in (DESTINATION, "generic/platform=iOS Simulator"):
+        raise JobError("invalid_job", "destination must be %s or generic/platform=iOS Simulator" % DESTINATION)
+    return job
+
+
+def load_job(job_dir, job_id, allow_file):
+    jf = os.path.join(job_dir, "job.json")
+    if not os.path.lexists(job_dir):
+        raw = sys.stdin.buffer.read(MAX_JOB_JSON + 1)
+        if len(raw) > MAX_JOB_JSON or not raw.strip():
+            raise JobError("invalid_job", "job.json on stdin missing or too large")
+        job = parse_job_json(raw)
+        validate_job(job, job_id, allow_file)
+        os.mkdir(job_dir, 0o700)
+        fd = os.open(jf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(job, f, sort_keys=True)
+        return job
+    st = os.lstat(job_dir)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != BUILDER_UID:
+        raise JobError("invalid_job", "job-dir is not a bh-builder directory")
+    extra = set(os.listdir(job_dir)) - {"job.json", "runner.err"}
+    if "job.json" not in os.listdir(job_dir) or extra:
+        raise JobError("invalid_job", "existing job-dir must contain only job.json (jobs run once)")
+    fst = os.lstat(jf)
+    if not stat.S_ISREG(fst.st_mode) or fst.st_size > MAX_JOB_JSON:
+        raise JobError("invalid_job", "job.json must be a small regular file")
+    with open(jf, "rb") as f:
+        job = parse_job_json(f.read())
+    return validate_job(job, job_id, allow_file)
+
+
+# ---------------------------------------------------------------- process control
+
+_libc = None
+
+
+def _list_uid_pids(uid):
+    """All pids owned by uid, via libproc proc_listpids(PROC_UID_ONLY) (no fork, fast)."""
+    global _libc
+    import ctypes
+    if _libc is None:
+        _libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+    PROC_UID_ONLY = 4
+    n = 4096
+    while True:
+        buf = (ctypes.c_int * n)()
+        got = _libc.proc_listpids(PROC_UID_ONLY, ctypes.c_uint32(uid), buf, ctypes.sizeof(buf))
+        if got <= 0:
+            raise OSError(ctypes.get_errno(), "proc_listpids failed")
+        count = got // ctypes.sizeof(ctypes.c_int)
+        if count < n:
+            return [p for p in buf[:count] if p > 0]
+        n *= 2
+
+
+def other_builder_pids():
+    me = os.getpid()
+    try:
+        pids = _list_uid_pids(BUILDER_UID)
+    except Exception:
+        out = subprocess.run(["/bin/ps", "-U", str(BUILDER_UID), "-o", "pid="], capture_output=True,
+                             text=True, timeout=10).stdout
+        pids = [int(x) for x in out.split() if x.isdigit()]
+    # Only real, positive pids other than init and ourselves: never 0, -1 or a negative (group) pid.
+    return [p for p in pids if isinstance(p, int) and p > 1 and p != me]
+
+
+# Apple per-user agents that launchd itself (re)starts on demand for uid 470 (parent = launchd).
+# The sweep still kills them every round; they are only excluded from the "nothing left" test,
+# because launchd may respawn them the moment anything of ours touches their service.
+LAUNCHD_AGENTS = {
+    "/usr/sbin/distnoted", "/usr/sbin/cfprefsd", "/usr/libexec/lsd", "/usr/libexec/trustd",
+    "/usr/libexec/secd", "/usr/libexec/secinitd", "/usr/libexec/containermanagerd",
+}
+
+
+def _reap_children():
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            return
+
+
+def _proc_path_ppid(pid):
+    """(executable path, ppid) via libproc, or None if the process is gone or a zombie."""
+    import ctypes
+    import struct
+    global _libc
+    if _libc is None:
+        _libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+    pbuf = ctypes.create_string_buffer(4096)              # PROC_PIDPATHINFO_MAXSIZE
+    if _libc.proc_pidpath(pid, pbuf, ctypes.sizeof(pbuf)) <= 0:
+        return None
+    PROC_PIDTBSDINFO, SZ = 3, 136                          # sizeof(struct proc_bsdinfo)
+    ibuf = ctypes.create_string_buffer(SZ)
+    if _libc.proc_pidinfo(pid, PROC_PIDTBSDINFO, ctypes.c_uint64(0), ibuf, SZ) != SZ:
+        return None
+    _flags, status, _xstatus, ipid, ppid = struct.unpack_from("<5I", ibuf.raw)
+    if ipid != pid or status == 5:                        # SZOMB
+        return None
+    return pbuf.value.decode("utf-8", "replace"), ppid
+
+
+def _non_agent(pids):
+    """pids that are not a launchd-spawned Apple agent (exact executable path from proc_pidpath,
+    parent launchd) and not a zombie. No fork: works when uid 470 is at its process limit."""
+    keep = []
+    for pid in pids:
+        try:
+            info = _proc_path_ppid(pid)
+        except Exception:
+            keep.append(pid)           # can't tell: count it as ours (fail closed)
+            continue
+        if info is None:
+            continue
+        path, ppid = info
+        if ppid == 1 and path in LAUNCHD_AGENTS:
+            continue
+        keep.append(pid)
+    return keep
+
+
+def kill_all_builder_processes():
+    """pkill -9 -u bh-builder, minus ourselves. Never kill(-1) (on macOS it also kills the caller,
+    and it is one typo away from the owner's whole session) and never a process group: only
+    explicit pids from proc_listpids(PROC_UID_ONLY, 470), each > 1 and != our pid.
+    Freeze-then-kill: SIGSTOP every other bh-builder pid until a scan finds nothing new, so a fork
+    loop can't outrun it, then SIGKILL them all. Returns True when nothing but launchd's own
+    on-demand Apple agents remains.
+    Refuses to run as any uid but bh-builder (checks getuid and geteuid)."""
+    if os.getuid() != BUILDER_UID or os.geteuid() != BUILDER_UID:
+        return False
+    for _ in range(5):
+        seen = set()
+        for _ in range(200):
+            fresh = [p for p in other_builder_pids() if p not in seen]
+            if not fresh:
+                break
+            for p in fresh:
+                try:
+                    os.kill(p, signal.SIGSTOP)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                seen.add(p)
+        for p in seen:
+            try:
+                os.kill(p, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            _reap_children()
+            if not _non_agent(other_builder_pids()):
+                return True
+            time.sleep(0.05)
+    _reap_children()
+    return not _non_agent(other_builder_pids())
+
+
+def remove_sysv_ipc():
+    """System V shm/sem/msg objects outlive their creator, so a job could leave one behind for the
+    next. (The sandbox denies shmat/semop/msgsnd, but not shmget/semget creation.) Remove every
+    object owned by bh-builder. Runs as bh-builder: ipcrm can't touch anyone else's objects."""
+    if os.getuid() != BUILDER_UID:
+        return []
+    removed = []
+    try:
+        out = subprocess.run(["/usr/bin/ipcs", "-m", "-s", "-q"], capture_output=True, text=True, timeout=10).stdout
+    except (subprocess.SubprocessError, OSError):
+        return removed
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) >= 5 and f[0] in ("m", "s", "q") and f[1].isdigit() and f[4] in (BUILDER_USER, str(BUILDER_UID)):
+            subprocess.run(["/usr/bin/ipcrm", "-" + f[0], f[1]], capture_output=True, timeout=10)
+            removed.append("%s:%s" % (f[0], f[1]))
+    return removed
+
+
+def make_removable(top):
+    """Clear BSD flags (uchg etc.) and give the owner rwx on every dir under top, without following
+    symlinks, so rmtree can delete what a build tried to make undeletable. Only works on our own
+    files (we run as their owner); errors are ignored here and surface in rmtree."""
+    def fix(p):
+        try:
+            os.chflags(p, 0, follow_symlinks=False)
+        except (OSError, NotImplementedError):
+            pass
+        try:
+            if stat.S_ISDIR(os.lstat(p).st_mode):
+                os.chmod(p, 0o700, follow_symlinks=False)
+        except (OSError, NotImplementedError):
+            pass
+    fix(top)                       # before walking: a 0000 top dir can't be listed
+    # topdown: each subdir is fixed while its parent is listed, before os.walk descends into it
+    for root, dirs, files in os.walk(top, topdown=True, onerror=lambda e: None):
+        for name in dirs + files:
+            fix(os.path.join(root, name))
+
+
+def remove_tree(p):
+    """Delete p (file or dir, never following a symlink). True on success."""
+    try:
+        st = os.lstat(p)
+    except FileNotFoundError:
+        return True
+    try:
+        if stat.S_ISDIR(st.st_mode):
+            make_removable(p)
+            shutil.rmtree(p)
+        else:
+            try:
+                os.chflags(p, 0, follow_symlinks=False)
+            except (OSError, NotImplementedError):
+                pass
+            os.unlink(p)
+        return True
+    except OSError as e:
+        if not os.path.lexists(p):
+            return True
+        trace("cleanup remove errno=%s path=%r: %s" % (e.errno, e.filename or p, e.strerror))
+        return False
+
+
+def wipe_dir_contents(path):
+    """Clear per-user state a job could use to influence the next job. Returns False if anything
+    could not be removed."""
+    try:
+        entries = os.listdir(path)
+    except FileNotFoundError:
+        return True
+    except OSError as e:
+        trace("cleanup listdir errno=%s path=%r: %s" % (e.errno, e.filename or path, e.strerror))
+        return False
+    ok = True
+    for name in entries:
+        ok = remove_tree(os.path.join(path, name)) and ok
+    return ok
+
+
+def clean_env(home, tmpdir):
+    return {
+        "HOME": home,
+        "TMPDIR": tmpdir,
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "USER": BUILDER_USER,
+        "LOGNAME": BUILDER_USER,
+        "LANG": "en_US.UTF-8",
+        "DEVELOPER_DIR": DEVELOPER_DIR,
+    }
+
+
+def user_dir(name):
+    """DARWIN_USER_TEMP_DIR / DARWIN_USER_CACHE_DIR (confstr names Python 3.9 doesn't know)."""
+    out = subprocess.run(["/usr/bin/getconf", name], capture_output=True, text=True, timeout=10,
+                         env=clean_env(BUILDER_HOME, "/tmp")).stdout.strip()
+    real = os.path.realpath(out).rstrip("/")
+    # These paths become sandbox params: require the expected place, a real directory owned by us,
+    # and no characters that could mean anything to SBPL (quotes, parens, backslash, ...).
+    if not SAFE_PATH_RE.match(real) or ".." in real.split("/"):
+        raise JobError("error", "unexpected %s" % name)
+    st = os.lstat(real)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != BUILDER_UID or stat.S_IMODE(st.st_mode) != 0o700:
+        raise JobError("error", "%s is not a bh-builder 0700 directory" % name)
+    return real
+
+
+# ---------------------------------------------------------------- the job
+
+class Runner:
+    def __init__(self, job_dir, job, profile, timeout, disk_mb=DEFAULT_DISK_BUDGET_MB, mem_mb=DEFAULT_MEM_BUDGET_MB):
+        self.job_dir = job_dir
+        self.job = job
+        self.profile = profile
+        self.timeout = timeout
+        self.disk_mb = disk_mb
+        self.mem_mb = mem_mb
+        self.next_budget_check = 0.0
+        self.pin = None
+        self.reachable_from = []
+        self.deadline = time.monotonic() + timeout
+        self.child = None
+        self.cancelled = False
+        self.timed_out = False
+        self.src = os.path.join(job_dir, "src")
+        self.gitdir = os.path.join(job_dir, "git")
+        self.home = os.path.join(job_dir, "home")
+        self.tmp = os.path.join(job_dir, "tmp")
+        self.dd = os.path.join(job_dir, "dd")
+        self.xcresult = os.path.join(job_dir, "result.xcresult")
+        self.logs = os.path.join(job_dir, "logs")
+        self.user_tmp = user_dir("DARWIN_USER_TEMP_DIR")
+        self.user_cache = user_dir("DARWIN_USER_CACHE_DIR")
+        self.env = clean_env(self.home, self.tmp + "/")
+
+    def sandbox_params(self):
+        return ["-D", "JOB=" + self.job_dir, "-D", "USER_TMP=" + self.user_tmp,
+                "-D", "USER_CACHE=" + self.user_cache, "-D", "BUILDER_HOME=" + BUILDER_HOME,
+                "-D", "DEVELOPER_DIR=" + DEVELOPER_DIR,
+                "-D", "BH_TEST_FILE_REMOTE=" + ("1" if self.job["remote"].startswith("file://") else "0")]
+
+    def run(self, argv, log_name, sandbox_profile=None, stdout_path=None):
+        """Run one child in its own session; enforce the job deadline. Returns exit code."""
+        if sandbox_profile:
+            argv = [SANDBOX_EXEC, "-f", sandbox_profile] + self.sandbox_params() + argv
+        log = open(os.path.join(self.logs, log_name), "ab")
+        out = open(stdout_path, "wb") if stdout_path else log
+        try:
+            self.child = subprocess.Popen(argv, cwd=self.job_dir, env=self.env, stdin=subprocess.DEVNULL,
+                                          stdout=out, stderr=log, start_new_session=True, close_fds=True)
+            while True:
+                if self.cancelled:
+                    raise JobError("cancelled", "job cancelled")
+                remaining = self.deadline - time.monotonic()
+                if remaining <= 0:
+                    self.timed_out = True
+                    raise JobError("timeout", "wall-clock timeout after %ss" % self.timeout)
+                if time.monotonic() >= self.next_budget_check:
+                    self.next_budget_check = time.monotonic() + BUDGET_POLL_S
+                    self.check_budgets()
+                try:
+                    return self.child.wait(timeout=min(remaining, 0.5))
+                except subprocess.TimeoutExpired:
+                    continue
+        finally:
+            if self.child and self.child.poll() is None:
+                kill_all_builder_processes()
+                try:
+                    self.child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            self.child = None
+            log.close()
+            if stdout_path:
+                out.close()
+
+    MAX_WALK_ENTRIES = 3000000
+
+    def disk_used_mb(self):
+        """Allocated size of the job dir and per-user T/C. Files that vanish mid-walk are skipped
+        (builds delete temp files constantly); anything else that stops the walk (permission,
+        too many entries) raises, and check_budgets fails the job closed. Unlinked-but-open files
+        are invisible here; bh-dispatch's statvfs check (root) covers those."""
+        total, n = 0, 0
+        for top in (self.job_dir, self.user_tmp, self.user_cache):
+            def onerror(e):
+                # vanished: fine. EPERM: macOS-protected dirs Apple daemons create in the per-user
+                # temp dir (e.g. T/com.apple.trustd/TemporaryItems); a build can't create an EPERM
+                # dir for an unsandboxed reader, and the dispatcher's statvfs check still counts its
+                # bytes. Anything else (EACCES from chmod 000, ELOOP, ...) fails the job closed.
+                if isinstance(e, FileNotFoundError) or getattr(e, "errno", None) == 1:
+                    return
+                raise e
+            for root, dirs, files in os.walk(top, onerror=onerror):
+                for name in dirs + files:
+                    n += 1
+                    if n > self.MAX_WALK_ENTRIES:
+                        raise OSError("more than %d entries" % self.MAX_WALK_ENTRIES)
+                    try:
+                        st = os.lstat(os.path.join(root, name))
+                    except FileNotFoundError:
+                        continue
+                    total += st.st_blocks * 512
+        return total // (1024 * 1024)
+
+    def mem_used_mb(self):
+        r = subprocess.run(["/bin/ps", "-U", str(BUILDER_UID), "-o", "rss="], capture_output=True,
+                           text=True, timeout=10)
+        vals = r.stdout.split()
+        if r.returncode != 0 or not vals or not all(v.isdigit() for v in vals):
+            raise OSError("ps failed (rc=%s)" % r.returncode)
+        return sum(int(v) for v in vals) // 1024
+
+    def check_budgets(self):
+        """Polled budgets (no per-uid disk quota or enforced RSS limit exists on macOS). Fails
+        closed: if usage can't be measured, the job stops."""
+        try:
+            used = self.disk_used_mb()
+            mem = self.mem_used_mb()
+        except Exception as e:
+            raise JobError("budget_check_failed", "could not measure job resources: %s" % str(e)[:200])
+        if used > self.disk_mb:
+            raise JobError("disk_budget", "job used %d MB of disk, budget %d MB" % (used, self.disk_mb))
+        if mem > self.mem_mb:
+            raise JobError("memory_budget", "bh-builder processes used %d MB RSS, budget %d MB" % (mem, self.mem_mb))
+
+    def git(self, *args, cwd=None, log="git.log"):
+        g = [GIT, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.symlinks=true",
+             "-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
+             "-c", "protocol.file.allow=" + ("always" if self.job["remote"].startswith("file://") else "never"),
+             "-c", "protocol.ext.allow=never", "-c", "submodule.recurse=false", "-c", "fetch.recurseSubmodules=false",
+             "-c", "core.protectNTFS=true", "-c", "core.protectHFS=true", "-c", "fsck.symlinkPointsToGitDir=error",
+             "-c", "transfer.fsckObjects=true", "-c", "advice.detachedHead=false", "-c", "credential.helper=",
+             "-c", "filter.lfs.smudge=", "-c", "filter.lfs.process=", "-c", "filter.lfs.required=false",
+             "-c", "core.askPass=", "-c", "http.followRedirects=false"]
+        if self.pin:
+            # resolve once (checked public), then make curl use exactly that address: no rebinding
+            g += ["-c", "http.curloptResolve=" + self.pin]
+        if cwd:
+            g += ["-C", cwd]
+        return g + list(args)
+
+    def git_out(self, *args, cwd=None):
+        path = os.path.join(self.tmp, "git-out")
+        rc = self.run(self.git(*args, cwd=cwd), "git.log", GIT_PROFILE, stdout_path=path)
+        with open(path) as f:
+            return rc, f.read().strip()
+
+    def pin_remote(self):
+        """host:443:addr for git's http.curloptResolve, from a single checked resolution."""
+        u = urllib.parse.urlsplit(self.job["remote"])
+        if u.scheme != "https":
+            return None
+        addrs = resolve_public(u.hostname)
+        v4 = [a for a in addrs if ":" not in a]
+        addr = v4[0] if v4 else "[%s]" % addrs[0]
+        return "%s:443:%s" % (u.hostname, addr)
+
+    def materialize(self):
+        """Fetch refs/heads/bh/* (blobs filtered), require the commit to be an ancestor of one of
+        them, check it out with hooks/filters/submodules/repo config disabled, verify it, and
+        refuse unsafe trees. Ported from helper/borrowed_hands_helper/gitmat.py."""
+        sha = self.job["commit"]
+        self.pin = self.pin_remote()
+        self.env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0",
+                         "GIT_LFS_SKIP_SMUDGE": "1", "GIT_ASKPASS": "/usr/bin/false", "SSH_ASKPASS": "/usr/bin/false",
+                         "GIT_ALLOW_PROTOCOL": "file:https" if self.job["remote"].startswith("file://") else "https"})
+
+        def must(argv, what, status="fetch_failed"):
+            if self.run(argv, "git.log", GIT_PROFILE) != 0:
+                raise JobError(status, "%s (see logs/git.log)" % what)
+
+        # --template= : no hooks or info/exclude from any template dir. A named remote is needed for
+        # --filter (partial clone); its URL is the validated job remote.
+        must(self.git("init", "-q", "--bare", "--template=", self.gitdir), "git init failed", "error")
+        must(self.git("remote", "add", "origin", self.job["remote"], cwd=self.gitdir), "git remote add failed", "error")
+        # The mirror is fresh per job, but start from no bh refs anyway (gitmat's stale-ref rule):
+        # reachability is decided only by refs this fetch produced.
+        rc, stale = self.git_out("for-each-ref", "--format=%(refname)", BH_LOCAL, cwd=self.gitdir)
+        for ref in stale.splitlines() if rc == 0 else []:
+            must(self.git("update-ref", "-d", ref, cwd=self.gitdir), "update-ref failed", "error")
+        base = ["fetch", "-q", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", "--filter=blob:none"]
+        must(self.git(*(base + ["origin", "+%s*:%s*" % (BH_PREFIX, BH_LOCAL)]), cwd=self.gitdir),
+             "could not fetch %s* from the remote" % BH_PREFIX)
+        if self.run(self.git("cat-file", "-e", sha + "^{commit}", cwd=self.gitdir), "git.log", GIT_PROFILE) != 0:
+            # not in any bh/* history: fetch it alone, only to tell "not found" from "not reachable"
+            must(self.git(*(base + ["origin", sha]), cwd=self.gitdir), "commit %s not found on the remote" % sha)
+        rc, kind = self.git_out("cat-file", "-t", sha, cwd=self.gitdir)
+        if rc != 0 or kind != "commit":
+            raise JobError("fetch_failed", "%s is not a commit" % sha)
+        rc, refs = self.git_out("for-each-ref", "--format=%(refname)", BH_LOCAL, cwd=self.gitdir)
+        reachable = [r for r in (refs.splitlines() if rc == 0 else []) if r.startswith(BH_LOCAL)
+                     and self.run(self.git("merge-base", "--is-ancestor", sha, r, cwd=self.gitdir),
+                                  "git.log", GIT_PROFILE) == 0]
+        if not reachable:
+            raise JobError("not_reachable", "commit %s is not reachable from %s on the configured remote; push it "
+                           "to a branch under bh/ first" % (sha, ALLOWED_REFS))
+        self.reachable_from = sorted("refs/heads/" + r[len("refs/remotes/origin/"):] for r in reachable)
+        must(self.git("worktree", "add", "--detach", "--no-checkout", self.src, sha, cwd=self.gitdir),
+             "worktree add failed")
+        must(self.git("checkout", "-q", "--detach", sha, cwd=self.src), "checkout failed")
+        rc1, head = self.git_out("rev-parse", "HEAD", cwd=self.src)
+        rc2, tree_wt = self.git_out("rev-parse", "HEAD^{tree}", cwd=self.src)
+        rc3, tree_db = self.git_out("rev-parse", sha + "^{tree}", cwd=self.gitdir)
+        rc4, dirty = self.git_out("status", "--porcelain", "--ignore-submodules=all", cwd=self.src)
+        if rc1 or rc2 or rc3 or rc4 or head != sha or tree_wt != tree_db or dirty:
+            raise JobError("fetch_failed", "materialized tree does not match commit")
+        for k in ("GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_TERMINAL_PROMPT", "GIT_LFS_SKIP_SMUDGE",
+                  "GIT_ASKPASS", "SSH_ASKPASS", "GIT_ALLOW_PROTOCOL"):
+            self.env.pop(k, None)
+        check_tree(self.src)
+        proj = os.path.join(self.src, self.job["project"])
+        real = os.path.realpath(proj)
+        if real != proj or not os.path.isdir(proj):
+            raise JobError("invalid_job", "project path missing or not a real directory in the commit")
+        deps = find_remote_dependencies(self.src)
+        if deps:
+            err = JobError("unsupported_dependencies",
+                           "remote Swift package dependencies are not supported in 0.1 (no network during builds). "
+                           "Vendor each package into the repo and reference it as a local path package "
+                           "(Xcode: Add Package > Add Local..., or .package(path:) in Package.swift), remove the "
+                           "remote pins, commit, and push to a bh/ branch.")
+            err.files = deps
+            raise err
+        return proj
+
+    def build(self, proj):
+        kind = "-workspace" if proj.endswith(".xcworkspace") else "-project"
+        argv = [XCODEBUILD, kind, proj, "-scheme", self.job["scheme"], "-configuration", self.job["configuration"],
+                "-destination", self.job["destination"], "-derivedDataPath", self.dd, "-resultBundlePath", self.xcresult,
+                "-disableAutomaticPackageResolution", "-hideShellScriptEnvironment",
+                # builder.sb already confines the whole build; SwiftPM's own manifest sandbox would be a
+                # nested sandbox_init, which a sandboxed process may not do (local packages fail with
+                # permissionDenied). Remote packages are refused before the build.
+                "-IDEPackageSupportDisableManifestSandbox=YES",
+                "-clonedSourcePackagesDirPath", os.path.join(self.dd, "SourcePackages"),
+                "-packageCachePath", os.path.join(self.dd, "PackageCache"),
+                "CODE_SIGNING_ALLOWED=NO", "CODE_SIGNING_REQUIRED=NO", "CODE_SIGN_IDENTITY=",
+                # Same reason for Swift macros (@State, #Preview, @Observable in the Xcode 27 SDK):
+                # swift-frontend runs each macro plugin under its own sandbox-exec, which fails inside
+                # builder.sb (sandbox_apply: Operation not permitted). This is Xcode's setting for
+                # swiftc -disable-sandbox; the plugins are the compiler's children, so builder.sb still
+                # confines them. A command-line setting overrides the project's own value.
+                "SWIFTC_DISABLE_SANDBOX=YES", "build"]
+        if self.job["destination"] == "generic/platform=iOS Simulator":
+            argv[1:1] = ["-sdk", "iphonesimulator"]
+        return self.run(argv, "xcodebuild.log", self.profile)
+
+    def results(self):
+        if not os.path.isdir(self.xcresult):
+            return None
+        path = os.path.join(self.logs, "build-results.json")
+        rc = self.run([XCRESULTTOOL, "get", "build-results", "--path", self.xcresult], "xcresulttool.log",
+                      self.profile, stdout_path=path)
+        if rc != 0:
+            return None
+        with open(path, "rb") as f:
+            raw = f.read(20 * 1024 * 1024)
+        try:
+            obj = json.loads(raw.decode("utf-8"))
+        except Exception:  # UnicodeDecodeError, ValueError, RecursionError
+            return None
+        return obj if isinstance(obj, dict) else None
+
+    def issue(self, item):
+        msg = str(item.get("message", ""))[:2000]
+        out = {"message": msg, "type": str(item.get("issueType", ""))[:100]}
+        url = item.get("sourceURL") or ""
+        if url.startswith("file://"):
+            base, _, frag = url.partition("#")
+            fpath = urllib.parse.unquote(urllib.parse.urlsplit(base).path)
+            for prefix in (self.src + "/", "/private" + self.src + "/"):
+                if fpath.startswith(prefix):
+                    fpath = fpath[len(prefix):]
+                    break
+            else:
+                fpath = os.path.basename(fpath)  # never leak paths outside the checkout
+            out["file"] = fpath
+            q = urllib.parse.parse_qs(frag)
+            # xcresulttool's StartingLineNumber/ColumnNumber are 0-based; report 1-based.
+            for key, name in (("StartingLineNumber", "line"), ("StartingColumnNumber", "column")):
+                v = q.get(key, [None])[0]
+                if v is not None and v.lstrip("-").isdigit():
+                    out[name] = int(v) + 1
+        return out
+
+
+def dotgit_like(name):
+    """True if name is .git after NFKC, dropping marks (Mn/Me), control/format chars and whitespace,
+    and casefolding (ported from helper gitmat.py). Homoglyphs from other scripts are an accepted gap."""
+    import unicodedata
+    kept = "".join(c for c in unicodedata.normalize("NFKC", name)
+                   if unicodedata.category(c) not in ("Mn", "Me", "Cc", "Cf", "Zl", "Zp") and not c.isspace())
+    return kept.casefold() == ".git"
+
+
+def check_tree(root):
+    """Fail if any entry looks like .git (other than the checkout's own .git file) or any symlink
+    resolves outside the checkout or into .git. lstat/readlink/realpath only; targets never opened.
+    Raises JobError("unsafe_tree")."""
+    real_root = os.path.realpath(root)
+    git_entry = os.path.join(real_root, ".git")
+    stack, n = [real_root], 0
+    while stack:
+        d = stack.pop()
+        with os.scandir(d) as it:
+            for e in it:
+                n += 1
+                if n > MAX_SCAN_ENTRIES:
+                    raise JobError("unsafe_tree", "checkout has more than %d entries" % MAX_SCAN_ENTRIES)
+                own_git = d == real_root and e.name == ".git"
+                if dotgit_like(e.name) and not own_git:
+                    raise JobError("unsafe_tree", "tree contains an entry that looks like .git: %s"
+                                   % os.path.relpath(e.path, real_root)[:200])
+                if e.is_symlink():
+                    target = os.path.realpath(e.path)
+                    inside = target == real_root or target.startswith(real_root + os.sep)
+                    in_git = target == git_entry or target.startswith(git_entry + os.sep)
+                    if not inside or in_git:
+                        raise JobError("unsafe_tree", "symlink %s points outside the checkout or into .git"
+                                       % os.path.relpath(e.path, real_root)[:200])
+                elif e.is_dir(follow_symlinks=False) and not own_git:
+                    stack.append(e.path)
+
+
+# Deliberately limited syntax, not a Swift evaluator. Only a literal .package(path: "...")
+# is accepted. Any other visible .package reference (including registry/computed arguments,
+# comments between the name and arguments, or parentheses inside remote strings) is refused.
+PACKAGE_CALL_RE = re.compile(r"\.\s*`?package`?(?![A-Za-z0-9_])")
+LOCAL_PACKAGE_RE = re.compile(r'\.\s*package\s*\(\s*path\s*:\s*"[^"\\\r\n]+"\s*\)')
+
+
+def _swift_has_unsupported_packages(text):
+    return any(LOCAL_PACKAGE_RE.match(text, m.start()) is None for m in PACKAGE_CALL_RE.finditer(text))
+
+
+def _resolved_has_remote_pins(data):
+    """Package.resolved v1 (object.pins[].repositoryURL) and v2/v3 (pins[].kind/location)."""
+    pins = data.get("pins")
+    if pins is None and isinstance(data.get("object"), dict):
+        pins = data["object"].get("pins")
+    if not isinstance(pins, list):
+        raise ValueError("no pins list")
+    for pin in pins:
+        if not isinstance(pin, dict):
+            raise ValueError("bad pin")
+        kind = pin.get("kind")
+        if kind in ("remoteSourceControl", "registry"):
+            return True
+        loc = pin.get("location") or pin.get("repositoryURL") or ""
+        if isinstance(loc, str) and re.match(r"^(https?|ssh|git)://|^[^/]+@[^/]+:", loc):
+            return True
+    return False
+
+
+def find_remote_dependencies(root):
+    """Bounded preflight only, never evaluates a manifest. Case-fold names but report stored paths.
+    Recognized symlinked, nonregular, unreadable, invalid UTF-8 or oversize files fail closed.
+    check_tree must run first; no links are followed here and the worktree's .git is skipped.
+    """
+    real_root = os.path.realpath(root)
+    found, stack, n = [], [real_root], 0
+    while stack:
+        d = stack.pop()
+        with os.scandir(d) as it:
+            for e in it:
+                n += 1
+                if n > MAX_SCAN_ENTRIES:
+                    raise JobError("unsafe_tree", "checkout has more than %d entries" % MAX_SCAN_ENTRIES)
+                name = e.name.casefold()
+                candidate = name in ("package.resolved", "project.pbxproj", "package.swift")
+                rel = os.path.relpath(e.path, real_root)
+                if e.is_symlink():
+                    if candidate:
+                        found.append(rel)
+                    continue
+                if e.is_dir(follow_symlinks=False):
+                    if not (d == real_root and e.name == ".git"):
+                        stack.append(e.path)
+                    continue
+                if not candidate:
+                    continue
+                try:
+                    if not e.is_file(follow_symlinks=False):
+                        found.append(rel)
+                        continue
+                    # O_NOFOLLOW and fstat preserve the no-link/no-special-file rule at open too.
+                    with open(e.path, "rb", opener=lambda p, flags: os.open(p, flags | os.O_NOFOLLOW | os.O_NONBLOCK)) as f:
+                        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                            found.append(rel)
+                            continue
+                        raw = f.read(MAX_SCAN_FILE + 1)
+                    if len(raw) > MAX_SCAN_FILE:
+                        found.append(rel)
+                        continue
+                    text = raw.decode("utf-8")
+                except (OSError, UnicodeError):
+                    found.append(rel)
+                    continue
+                if name == "package.resolved":
+                    try:
+                        hit = _resolved_has_remote_pins(json.loads(text))
+                    except (ValueError, TypeError, AttributeError, RecursionError):
+                        hit = True
+                elif name == "project.pbxproj":
+                    hit = "XCRemoteSwiftPackageReference" in text
+                else:
+                    hit = _swift_has_unsupported_packages(text)
+                if hit:
+                    found.append(rel)
+    return sorted(found)[:MAX_DEP_FILES]
+
+
+def write_result(job_dir, result):
+    """<job-dir>/result.json, read by bh-dispatch (root, O_NOFOLLOW). Written after teardown, when
+    no other bh-builder process is alive; anything already there is replaced, never followed."""
+    try:
+        dfd = os.open(job_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return
+    try:
+        try:
+            os.unlink("result.json", dir_fd=dfd)
+        except FileNotFoundError:
+            pass
+        except IsADirectoryError:
+            return
+        fd = os.open("result.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(result, sort_keys=True) + "\n")
+    except OSError:
+        pass
+    finally:
+        os.close(dfd)
+
+
+def log_tail(path):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - LOG_TAIL_BYTES))
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def main(argv):
+    started = time.monotonic()
+    allow_file = False
+    profile = DEFAULT_PROFILE
+    timeout = DEFAULT_TIMEOUT
+    budgets = {}
+    args = list(argv)
+    result = {"v": 1, "status": "error"}
+    job_dir_ok = False
+    try:
+        while args and args[0].startswith("--"):
+            a = args.pop(0)
+            if a == "--allow-file-remote":
+                allow_file = True
+            elif a == "--profile" and args:
+                profile = os.path.realpath(args.pop(0))
+            elif a in ("--disk-budget-mb", "--mem-budget-mb") and args and NUM_RE.fullmatch(args[0]):
+                v = int(args.pop(0))
+                lim = MAX_DISK_BUDGET_MB if a == "--disk-budget-mb" else MAX_MEM_BUDGET_MB
+                if not 1 <= v <= lim:
+                    raise JobError("usage", "%s must be 1..%d" % (a, lim))
+                budgets[a] = v
+            elif a == "--timeout" and args and NUM_RE.fullmatch(args[0]):
+                timeout = int(args.pop(0))
+                if not 1 <= timeout <= MAX_TIMEOUT:
+                    raise JobError("usage", "timeout must be 1..%d" % MAX_TIMEOUT)
+            else:
+                raise JobError("usage", "unknown option %s" % a)
+        if len(args) != 1:
+            raise JobError("usage", "usage: bh-runner [--allow-file-remote] [--profile P] [--timeout S] [--disk-budget-mb N] [--mem-budget-mb N] <job-dir>")
+        if os.geteuid() != BUILDER_UID or os.getuid() != BUILDER_UID:
+            raise JobError("usage", "must run as %s (uid %d)" % (BUILDER_USER, BUILDER_UID))
+        if not os.path.isfile(profile):
+            raise JobError("usage", "sandbox profile not found")
+        os.umask(0o077)
+        if not os.path.isdir(JOBS_ROOT):
+            os.mkdir(JOBS_ROOT, 0o700)
+        job_id = validate_job_dir(args[0])
+        result["job_id"] = job_id
+        job_dir_ok = True
+        lock_fd = os.open(JOBS_ROOT + "/.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise JobError("busy", "another job is running")
+        job = load_job(args[0], job_id, allow_file)
+        result["commit"] = job["commit"]
+        r = Runner(args[0], job, profile, timeout, budgets.get("--disk-budget-mb", DEFAULT_DISK_BUDGET_MB),
+                   budgets.get("--mem-budget-mb", DEFAULT_MEM_BUDGET_MB))
+
+        def on_signal(signum, frame):
+            r.cancelled = True     # only a flag: the run loop raises, and teardown does the killing
+        for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(s, on_signal)
+
+        # One job at a time: nothing else of ours may be running, or left over from the last job.
+        kill_all_builder_processes()
+        for d in (r.home, r.tmp, r.logs):
+            os.mkdir(d, 0o700)
+        try:
+            trace("materialize")
+            proj = r.materialize()
+            trace("build")
+            # The runner's pid is deliberately visible to the build (pids aren't secret): the tests
+            # use it to show the build still can't signal the runner (builder.sb denies signals
+            # outside the sandbox).
+            with open(os.path.join(r.tmp, ".bh-runner-pid"), "w") as f:
+                f.write("%d\n" % os.getpid())
+            rc = r.build(proj)
+            trace("results rc=%s" % rc)
+            br = r.results()
+            result["xcodebuild_exit"] = rc
+            if br is not None:
+                errs = br.get("errors") or []
+                warns = br.get("warnings") or []
+                result["errors"] = [r.issue(e) for e in errs[:MAX_ERRORS] if isinstance(e, dict)]
+                result["warnings"] = [r.issue(w) for w in warns[:MAX_WARNINGS] if isinstance(w, dict)]
+                result["error_count"] = int(br.get("errorCount", len(errs)))
+                result["warning_count"] = int(br.get("warningCount", len(warns)))
+                result["status"] = "succeeded" if rc == 0 and br.get("status") == "succeeded" else "failed"
+            else:
+                result["errors"] = []
+                result["warnings"] = []
+                result["error_count"] = 0
+                result["warning_count"] = 0
+                result["status"] = "succeeded" if rc == 0 else "failed"
+                result["note"] = "no build-results from xcresulttool"
+            if result["status"] == "failed":
+                result["log_tail"] = log_tail(os.path.join(r.logs, "xcodebuild.log"))
+        except JobError as e:
+            if r.cancelled and e.status not in ("timeout",):
+                e = JobError("cancelled", "job cancelled")
+            result["status"] = e.status
+            result["message"] = e.message
+            if getattr(e, "files", None):
+                result["files"] = e.files
+        finally:
+            # Teardown on every path: kill the whole uid, drop submitted launchd jobs, clear per-user
+            # temp/cache dirs and anything written to the builder's real Preferences.
+            trace("teardown")
+            killed_clean = kill_all_builder_processes()
+            killed_clean = kill_all_builder_processes() and killed_clean
+            trace("teardown swept=%s" % killed_clean)
+            result["cleanup_ok"] = killed_clean
+            result["sysv_ipc_removed"] = remove_sysv_ipc()
+            wiped = wipe_dir_contents(r.user_tmp)
+            wiped = wipe_dir_contents(r.user_cache) and wiped
+            wiped = wipe_dir_contents(os.path.join(BUILDER_HOME, "Library", "Preferences")) and wiped
+            wiped = wipe_dir_contents(os.path.join(BUILDER_HOME, "Library", "LaunchAgents")) and wiped
+            result["wipe_ok"] = wiped
+    except JobError as e:
+        result["status"] = e.status
+        result["message"] = e.message
+    except Exception as e:  # never let a traceback replace the one JSON line
+        result["status"] = "error"
+        result["message"] = "%s: %s" % (type(e).__name__, str(e)[:500])
+        kill_all_builder_processes()
+    result["duration_s"] = round(time.monotonic() - started, 2)
+    if job_dir_ok:
+        write_result(args[0], result)
+    emit(result)
+    return 0 if result["status"] == "succeeded" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

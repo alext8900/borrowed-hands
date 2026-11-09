@@ -1,0 +1,18 @@
+name: LocalDep
+options:
+  bundleIdPrefix: com.example.bhprobe
+  deploymentTarget:
+    macOS: "14.0"
+packages:
+  LocalPkg:
+    path: LocalPkg
+targets:
+  LocalDep:
+    type: tool
+    platform: macOS
+    sources: [Sources]
+    settings:
+      base:
+        SWIFT_VERSION: "5.0"
+    dependencies:
+      - package: LocalPkg

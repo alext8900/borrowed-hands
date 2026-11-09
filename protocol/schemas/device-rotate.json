@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://borrowed-hands.dev/protocol/v1/device-rotate.json",
+  "title": "device.rotate body",
+  "type": "object",
+  "properties": {
+    "new_pubkey": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{43}$"
+    },
+    "sig_new": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{86}$"
+    }
+  },
+  "required": [
+    "new_pubkey",
+    "sig_new"
+  ],
+  "additionalProperties": false
+}

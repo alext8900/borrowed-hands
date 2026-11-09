@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://borrowed-hands.dev/protocol/v1/params-screen-capture.json",
+  "title": "contract params for screen.capture",
+  "type": "object",
+  "properties": {
+    "display": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 16
+    },
+    "max_px": {
+      "type": "integer",
+      "minimum": 256,
+      "maximum": 2000
+    }
+  },
+  "required": [
+    "display",
+    "max_px"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,31 @@
+name: MacroApp
+# SwiftUI app whose build needs Xcode's SDK macro plugins (@State, #Preview, @Observable).
+# The project also tries to turn the compiler's macro-plugin sandbox back on and sets its own
+# OTHER_SWIFT_FLAGS without $(inherited): bh-runner's command-line SWIFTC_DISABLE_SANDBOX=YES
+# must still win, and the project's own flags must still reach the compiler.
+# Regenerate with: xcodegen generate --spec tests/macro-app/project.yml --project tests/macro-app
+options:
+  deploymentTarget:
+    iOS: '18.0'
+    macOS: '15.0'
+settings:
+  base:
+    SWIFTC_DISABLE_SANDBOX: NO
+targets:
+  MacroApp:
+    type: application
+    supportedDestinations: [macOS, iOS]
+    sources: [Sources]
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.borrowedhands.macro
+        SWIFT_VERSION: '6.0'
+        SWIFTC_DISABLE_SANDBOX: NO
+        SWIFTC_DISABLE_SANDBOX[sdk=macosx*]: NO
+        SWIFTC_DISABLE_SANDBOX[sdk=iphonesimulator*]: NO
+      configs:
+        Debug:
+          OTHER_SWIFT_FLAGS: -DBH_PROJECT_FLAG
+        Release:
+          OTHER_SWIFT_FLAGS: ''

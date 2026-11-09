@@ -1,0 +1,34 @@
+name: borrowed-hands
+version: 0.1.0
+description: "Borrow locally granted Xcode builds and system info from a Mac you paired. The Mac dials out and decides."
+author: Alex Thompson
+requires_hermes: ">=0.22.7"
+provides_tools:
+  - hands_find
+  - hands_system_info
+  - hands_xcode_build
+  - hands_job
+  - hands_screen_capture
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
+python_dependencies:
+  - "aiohttp>=3.9,<4"
+  - "cryptography>=42,<51"
+config_schema:
+  listen:
+    type: dict
+    description: "{enabled: bool (default false; env BH_LISTEN), host: str (default 0.0.0.0), port: int (default 8790; env BH_PORT)}"
+  public_url:
+    type: str
+    description: "wss://<public host>/bh/v1/ws; env BH_PUBLIC_URL, else derived from RAILWAY_PUBLIC_DOMAIN. Required to pair."
+  owners:
+    type: list
+    description: "platform:user_id entries allowed to run /hands (env BH_OWNERS, comma-separated)."
+  max_frame_bytes:
+    type: int
+    description: "Max WebSocket frame size accepted (default and maximum 16777216)."
+  trusted_proxy:
+    type: str
+    description: "'railway' to take the client address from the last X-Forwarded-For entry (env BH_TRUSTED_PROXY); unset = socket peer."
+license: MIT

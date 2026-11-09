@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://borrowed-hands.dev/protocol/v1/contract.json",
+  "title": "Signed action contract (PROTOCOL 4.1). Verify the signature over the raw bytes BEFORE parsing. Also enforce expires_at - issued_at <= 600000 (not expressible here).",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "job_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "nonce": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{22}$"
+    },
+    "helper_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "server_key_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{16}$"
+    },
+    "action": {
+      "enum": [
+        "xcode.build",
+        "screen.capture",
+        "system.info"
+      ]
+    },
+    "params": {
+      "type": "object"
+    },
+    "issued_at": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "expires_at": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "approval_ref": {
+      "type": "string",
+      "pattern": "^(none|hermes:[0-9a-f-]{36})$"
+    }
+  },
+  "required": [
+    "action",
+    "approval_ref",
+    "expires_at",
+    "helper_id",
+    "issued_at",
+    "job_id",
+    "nonce",
+    "params",
+    "server_key_id",
+    "v"
+  ],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "xcode.build"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "params-xcode-build.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "screen.capture"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "params-screen-capture.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "system.info"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "params-system-info.json"
+          }
+        }
+      }
+    }
+  ]
+}

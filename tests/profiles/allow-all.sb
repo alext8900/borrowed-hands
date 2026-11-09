@@ -1,0 +1,3 @@
+(version 1)
+;; Baseline for the probe suite: no sandbox restrictions at all (uid separation only).
+(allow default)

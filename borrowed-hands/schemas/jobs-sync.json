@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://borrowed-hands.dev/protocol/v1/jobs-sync.json",
+  "title": "jobs.sync body (PROTOCOL 4.5)",
+  "type": "object",
+  "properties": {
+    "active": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          },
+          "state": {
+            "enum": [
+              "received",
+              "queued",
+              "materializing",
+              "building",
+              "succeeded",
+              "failed",
+              "cancelled",
+              "expired"
+            ]
+          }
+        },
+        "required": [
+          "job_id",
+          "state"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "results": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "$ref": "job-result.json"
+      }
+    }
+  },
+  "required": [
+    "active",
+    "results"
+  ],
+  "additionalProperties": false
+}

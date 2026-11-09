@@ -1,0 +1,21 @@
+name: Hang
+options:
+  bundleIdPrefix: com.example.bhprobe
+  deploymentTarget:
+    macOS: "14.0"
+targets:
+  Hang:
+    type: tool
+    platform: macOS
+    sources: [Sources]
+    settings:
+      base:
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        SWIFT_VERSION: "5.0"
+    preBuildScripts:
+      - name: HangScript
+        script: |
+          # A detached daemon (setsid, closed fds) plus a script that never finishes.
+          /usr/bin/perl -MPOSIX -e 'exit 0 if fork; POSIX::setsid(); exit 0 if fork; $0="bh-hang-marker-daemon"; open STDIN,"</dev/null"; open STDOUT,">/dev/null"; open STDERR,">/dev/null"; POSIX::close($_) for 3..255; sleep 3600;'
+          exec /usr/bin/perl -e '$0="bh-hang-marker-script"; sleep 3600'
+        basedOnDependencyAnalysis: false

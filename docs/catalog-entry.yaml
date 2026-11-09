@@ -1,0 +1,35 @@
+# Hermes plugin catalog entry for Borrowed Hands.
+# sha is pinned to the published commit after the repository is pushed; revalidate against the catalog schema
+# (NousResearch/hermes-agent plugin-catalog/README.md) at submission time.
+name: borrowed-hands
+repo: 'https://github.com/alext8900/borrowed-hands'
+sha: 'SET_AFTER_PUBLISH'
+subdir: borrowed-hands
+description: >-
+  Borrow a paired Mac's locally granted Xcode compiler from Hermes and return structured diagnostics.
+maintainer: alext8900
+tier: community
+category: tools
+requires_hermes: '>=0.22.7'
+version: '0.1.0'
+# Server plugin platforms; the separate build helper requires an Apple silicon Mac with Xcode.
+platforms: [linux, macos]
+# readme resolves under subdir; that README discloses the separate Mac install and capture stub.
+readme: true
+known_issues:
+  - 'hands_screen_capture is registered but unavailable: no helper executor in this version.'
+  - 'iOS Simulator support is compile-only; no boot, install, UI or tests.'
+  - 'Public HTTPS repositories and bh/* commits only; remote Swift packages are unsupported.'
+  - 'Recorded builds report wipe_ok=false for protected per-user state; full persistent-state removal is not established.'
+capabilities:
+  provides_tools:
+    - hands_find
+    - hands_system_info
+    - hands_xcode_build
+    - hands_job
+    - hands_screen_capture
+  provides_hooks:
+    - pre_tool_call
+    - post_tool_call
+  provides_middleware: []
+  requires_env: []

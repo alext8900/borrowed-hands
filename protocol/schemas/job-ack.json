@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://borrowed-hands.dev/protocol/v1/job-ack.json",
+  "title": "job.ack body",
+  "type": "object",
+  "properties": {
+    "job_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+      },
+      "maxItems": 500
+    }
+  },
+  "required": [
+    "job_ids"
+  ],
+  "additionalProperties": false
+}

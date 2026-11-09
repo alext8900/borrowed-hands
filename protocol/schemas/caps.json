@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://borrowed-hands.dev/protocol/v1/caps.json",
+  "title": "caps body (PROTOCOL 6.1)",
+  "type": "object",
+  "properties": {
+    "helper_version": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9 ._+-]{0,63}$"
+    },
+    "os": {
+      "const": "macos"
+    },
+    "os_version": {
+      "type": "string",
+      "pattern": "^[0-9]+(\\.[0-9]+){0,3}$"
+    },
+    "arch": {
+      "enum": [
+        "arm64",
+        "x86_64"
+      ]
+    },
+    "busy": {
+      "type": "boolean"
+    },
+    "queue_depth": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "system.info"
+              },
+              "v": {
+                "const": 1
+              }
+            },
+            "required": [
+              "name",
+              "v"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "screen.capture"
+              },
+              "v": {
+                "const": 1
+              },
+              "displays": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 16
+              }
+            },
+            "required": [
+              "displays",
+              "name",
+              "v"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "xcode.build"
+              },
+              "v": {
+                "const": 1
+              },
+              "xcode": {
+                "type": "string",
+                "pattern": "^[0-9]+(\\.[0-9]+){0,2}$"
+              },
+              "xcode_build": {
+                "type": "string",
+                "pattern": "^[0-9A-Za-z]{1,16}$"
+              },
+              "workspaces": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "workspace_id": {
+                      "type": "string",
+                      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+                    },
+                    "repo_fingerprint": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{64}$"
+                    },
+                    "schemes": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "pattern": "^[A-Za-z0-9_][A-Za-z0-9 ._+-]{0,63}$"
+                      },
+                      "maxItems": 32
+                    },
+                    "configurations": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "pattern": "^[A-Za-z0-9_][A-Za-z0-9 ._+-]{0,63}$"
+                      },
+                      "maxItems": 8
+                    },
+                    "destinations": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200
+                      },
+                      "maxItems": 8
+                    },
+                    "expires_at": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "minimum": 0
+                    }
+                  },
+                  "required": [
+                    "configurations",
+                    "destinations",
+                    "expires_at",
+                    "repo_fingerprint",
+                    "schemes",
+                    "workspace_id"
+                  ],
+                  "additionalProperties": false
+                },
+                "maxItems": 32
+              }
+            },
+            "required": [
+              "name",
+              "v",
+              "workspaces",
+              "xcode",
+              "xcode_build"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "maxItems": 8
+    }
+  },
+  "required": [
+    "arch",
+    "busy",
+    "capabilities",
+    "helper_version",
+    "name",
+    "os",
+    "os_version",
+    "queue_depth"
+  ],
+  "additionalProperties": false
+}

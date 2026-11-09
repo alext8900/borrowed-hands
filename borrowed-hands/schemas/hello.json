@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://borrowed-hands.dev/protocol/v1/hello.json",
+  "title": "hello body",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "server_nonce": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{43}$"
+    },
+    "server_key_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{16}$"
+    },
+    "server_time_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "max_frame": {
+      "const": 16777216
+    }
+  },
+  "required": [
+    "max_frame",
+    "server_key_id",
+    "server_nonce",
+    "server_time_ms",
+    "v"
+  ],
+  "additionalProperties": false
+}

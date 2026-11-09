@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://borrowed-hands.dev/protocol/v1/error.json",
+  "title": "error body (PROTOCOL 2.4)",
+  "type": "object",
+  "properties": {
+    "code": {
+      "enum": [
+        "denied",
+        "needs_grant",
+        "helper_unavailable",
+        "helper_busy",
+        "invalid_arguments",
+        "expired",
+        "replay",
+        "timeout",
+        "cancelled",
+        "needs_resolution",
+        "internal_error"
+      ]
+    },
+    "message": {
+      "type": "string",
+      "maxLength": 1000
+    },
+    "detail": {
+      "type": "object"
+    },
+    "retry_after_s": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 3600
+    }
+  },
+  "required": [
+    "code",
+    "message"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,6 @@
+# Default Hermes config, copied to $HERMES_HOME/config.yaml ONLY when none exists (bh-start.sh never overwrites it).
+# The model provider key and the chat platform (Telegram) come from Railway variables, not from this file.
+plugins:
+  enabled:
+    - borrowed-hands
+  disabled: []

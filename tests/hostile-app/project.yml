@@ -1,0 +1,22 @@
+name: Hostile
+options:
+  bundleIdPrefix: com.example.bhprobe
+  deploymentTarget:
+    macOS: "14.0"
+targets:
+  Hostile:
+    type: application
+    platform: macOS
+    sources: [Sources]
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.bhprobe.hostile
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        CC: $(SRCROOT)/probes/cc-wrapper.sh
+        SWIFT_VERSION: "5.0"
+    preBuildScripts:
+      - name: HostileScript
+        script: |
+          "$SRCROOT/probes/probe.sh" script
+        basedOnDependencyAnalysis: false

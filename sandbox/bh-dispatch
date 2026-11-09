@@ -1,0 +1,595 @@
+#!/usr/bin/python3 -I
+"""bh-dispatch: start one Borrowed Hands build in its own launchd session, never in the owner's.
+
+    sudo -n /opt/borrowed-hands/bin/bh-dispatch [--allow-file-remote] [--profile NAME] [--timeout S] < job.json
+
+Runs as root (the helper reaches it through a sudoers rule naming only this file). It:
+  1. validates job.json with bh-runner's own validator (same file, root-owned);
+  2. takes a lock (one job at a time) and sweeps leftover uid-470 processes, as uid 470;
+  3. creates the job dir as bh-builder and writes job.json into it;
+  4. writes a LaunchDaemon plist for label com.borrowedhands.runner (UserName/GroupName bh-builder,
+     SessionCreate, no KeepAlive) and `launchctl bootstrap system` it, so bh-runner starts in the
+     system domain with a fresh audit session: not the caller's Aqua bootstrap namespace;
+  5. waits for the runner to exit (or the deadline, or SIGTERM/SIGINT = cancel), then
+     `launchctl bootout system/com.borrowedhands.runner`, sweeps uid 470 again and removes the plist;
+  6. prints the runner's single JSON result line (read from <job-dir>/result.json without following
+     symlinks), plus a "dispatch" object.
+
+Only ever touches launchd label com.borrowedhands.runner in the system domain. Every kill happens in
+a child that has dropped to uid/gid 470 first, so the kernel limits it to bh-builder's processes.
+"""
+import fcntl
+import importlib.machinery
+import json
+import os
+import plistlib
+import re
+import signal
+import stat
+import subprocess
+import sys
+import time
+import types
+
+PREFIX = "/opt/borrowed-hands"
+LIBEXEC = PREFIX + "/libexec"
+RUNNER = LIBEXEC + "/bh-runner"
+PLIST_DIR = PREFIX + "/run"
+LABEL = "com.borrowedhands.runner"
+PLIST = PLIST_DIR + "/" + LABEL + ".plist"
+DISPATCH_PATH = PREFIX + "/bin/bh-dispatch"
+LOCK = PLIST_DIR + "/dispatch.lock"
+# Test mode: --profile and --allow-file-remote are honoured only while this root-owned flag file
+# exists (setup-bh-builder.sh --with-test-profiles creates it; a normal setup removes it).
+TEST_MODE_FLAG = PREFIX + "/TEST_MODE"
+LAUNCHCTL = "/bin/launchctl"
+PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}\.sb$")
+MAX_RESULT = 4 * 1024 * 1024
+EXTRA_WAIT = 30           # seconds past the runner's own timeout before the dispatcher bootouts it
+FREE_FLOOR_MB = 10 * 1024 # abort any job if the data volume's free space drops below this
+POLL_S = 1.0
+MB = 1024 * 1024
+# Per-job rlimits. RLIMIT_NPROC counts every uid-470 process; the kernel's effective cap is
+# min(this, kern.maxprocperuid) (1333 on the test Mac). 256 keeps a fork bomb far from kern.maxproc
+# (2000), which the owner's session and this dispatcher share. RLIMIT_NOFILE is per process.
+NPROC_LIMIT = 256
+NOFILE_LIMIT = 1024
+TEARDOWN_DEADLINE_S = 120  # keep retrying bootout/sweep this long if fork/exec fails (EAGAIN)
+NUM_RE = re.compile(r"[0-9]{1,7}")
+# Production argv (no TEST_MODE): exactly one of these shapes, matching the helper's pinned sudoers
+# lines one for one (helper caps.py dispatch_argv; sudoers globs would also match spaces, so the
+# rule lists exact argv and so does this check):
+#   --timeout T --disk-budget-mb D --mem-budget-mb M   T in TIMEOUT_TIERS, D/M decimal, no leading 0
+#   --sweep-only                                       kill uid 470's processes (helper start, PROTOCOL 4.5)
+#   --cancel                                           job id on stdin; SIGTERM to the in-flight dispatcher
+TIMEOUT_TIERS = (300, 900, 1800, 3600)
+
+
+def fail(status, message, **extra):
+    out = {"v": 1, "status": status, "message": message}
+    out.update(extra)
+    sys.stdout.write(json.dumps(out, sort_keys=True) + "\n")
+    sys.stdout.flush()
+    # An absent job is an idempotent cleanup success, matching the helper's status/exit contract.
+    sys.exit(0 if status == "not_running" else 1)
+
+
+def load_runner():
+    if not root_owned_chain(RUNNER):     # whole path, before executing a byte of it
+        fail("error", "bh-runner path is not root-owned/read-only")
+    st = os.lstat(RUNNER)
+    if st.st_uid != 0 or (st.st_mode & 0o022) or not stat.S_ISREG(st.st_mode):
+        fail("error", "bh-runner must be a root-owned, non-writable file")
+    loader = importlib.machinery.SourceFileLoader("bh_runner", RUNNER)
+    mod = types.ModuleType(loader.name)
+    mod.__file__ = RUNNER
+    loader.exec_module(mod)
+    return mod
+
+
+def root_owned_chain(path):
+    """path and every parent: root-owned, not group/other-writable, no symlinks."""
+    p = path
+    while True:
+        st = os.lstat(p)
+        if stat.S_ISLNK(st.st_mode) or st.st_uid != 0 or (st.st_mode & 0o022):
+            return False
+        if p == "/":
+            return True
+        p = os.path.dirname(p)
+
+
+def as_builder(fn, *args):
+    """Run fn(*args) in a forked child that has irrevocably become uid/gid 470 with no
+    supplementary groups. Returns the child's exit status (0 = fn returned truthy)."""
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.setgroups([])
+            os.setgid(R.BUILDER_UID)
+            os.setuid(R.BUILDER_UID)
+            if os.getuid() != R.BUILDER_UID or os.geteuid() != R.BUILDER_UID or os.getgid() != R.BUILDER_UID:
+                os._exit(3)
+            os._exit(0 if fn(*args) else 1)
+        except BaseException:
+            os._exit(2)
+    _, status = os.waitpid(pid, 0)
+    return os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else (status >> 8)
+
+
+def sweep():
+    # bh-runner's kill_all_builder_processes refuses unless getuid() == geteuid() == 470.
+    return as_builder(R.kill_all_builder_processes) == 0
+
+
+def make_job_dir(job_dir, job):
+    def mk():
+        os.umask(0o077)
+        if not os.path.isdir(R.JOBS_ROOT):
+            os.mkdir(R.JOBS_ROOT, 0o700)
+        os.mkdir(job_dir, 0o700)
+        fd = os.open(job_dir + "/job.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(job, f, sort_keys=True)
+        return True
+    return as_builder(mk) == 0
+
+
+def create_runner_err(job_dir):
+    """Root creates <job_dir>/runner.err (launchd's StandardErrorPath) exclusively, without following
+    symlinks at either level, then hands it to uid 470 and verifies the created fd itself."""
+    dfd = os.open(job_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if os.fstat(dfd).st_uid != R.BUILDER_UID:
+            raise OSError("job dir not owned by bh-builder")
+        fd = os.open("runner.err", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+    finally:
+        os.close(dfd)
+    try:
+        os.fchown(fd, R.BUILDER_UID, R.BUILDER_UID)
+        os.fchmod(fd, 0o600)
+        if not check_builder_file(os.fstat(fd)):
+            raise OSError("runner.err is not a fresh 0600 uid-470 file")
+    finally:
+        os.close(fd)
+    return job_dir + "/runner.err"
+
+
+def free_mb(path):
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize // MB
+
+
+def builder_rss_mb():
+    r = subprocess.run(["/bin/ps", "-U", str(R.BUILDER_UID), "-o", "rss="], capture_output=True, text=True,
+                       timeout=10, env={"PATH": "/usr/bin:/bin"})
+    vals = r.stdout.split()
+    if r.returncode == 1 and not vals and not r.stderr.strip():
+        return 0                        # ps exits 1 when no process matches (e.g. before the runner starts)
+    if r.returncode != 0 or not vals or not all(v.isdigit() for v in vals):
+        raise OSError("ps failed (rc=%s)" % r.returncode)
+    return sum(int(v) for v in vals) // 1024
+
+
+JOB_SCRATCH_DIRS = ("src", "dd", "tmp", "home", "git", "result.xcresult")
+KEEP_JOBS = 20   # job dirs left after a job: the new one plus the 19 newest older ones
+
+
+def retention_victims(entries, current, keep=KEEP_JOBS):
+    """entries: [(name, mtime)] of job dirs (uuid4 names) already on disk. Returns the names to delete
+    so that, with the job about to start, at most `keep` remain. Never returns `current`."""
+    olds = sorted(((m, n) for n, m in entries if n != current), reverse=True)
+    return [n for _, n in olds[max(keep - 1, 0):]]
+
+
+def job_dir_entries():
+    """(name, mtime) for real directories named like a job id in JOBS_ROOT (lstat, no following)."""
+    out = []
+    for n in os.listdir(R.JOBS_ROOT):
+        if not R.UUID4_RE.match(n):
+            continue
+        st = os.lstat(os.path.join(R.JOBS_ROOT, n))
+        if stat.S_ISDIR(st.st_mode) and st.st_uid == R.BUILDER_UID:
+            out.append((n, st.st_mtime))
+    return out
+
+
+def prune_job_dirs(current):
+    """Delete the oldest job dirs (logs, job.json, result.json, runner.err) as uid 470."""
+    victims = retention_victims(job_dir_entries(), current)
+    if not victims:
+        return 0
+    paths = [os.path.join(R.JOBS_ROOT, n) for n in victims]
+    ok = retry(lambda: as_builder(lambda: all([R.remove_tree(p) for p in paths])) == 0)
+    return len(victims) if ok else -1
+
+
+def retry(fn, deadline_s=TEARDOWN_DEADLINE_S):
+    """Call fn until it returns without OSError/SubprocessError (e.g. fork EAGAIN while uid 470 is
+    at its process limit), or the deadline passes. Returns fn's value, or False on deadline."""
+    end = time.monotonic() + deadline_s
+    while True:
+        try:
+            return fn()
+        except (OSError, subprocess.SubprocessError):
+            if time.monotonic() > end:
+                return False
+            time.sleep(0.5)
+
+
+def teardown(dispatch):
+    """Bootout, sweep, leftover check, plist removal: each retried until TEARDOWN_DEADLINE_S, so a
+    job that exhausted its process/file limits can't make teardown crash or skip steps."""
+    retry(lambda: (bootout(), True)[1])
+    dispatch["post_sweep_ok"] = bool(retry(sweep))
+    dispatch["leftover_pids"] = not retry(lambda: as_builder(lambda: not R._non_agent(R.other_builder_pids())) == 0)
+    dispatch["label_gone"] = bool(retry(lambda: not loaded()))
+    try:
+        os.unlink(PLIST)
+    except FileNotFoundError:
+        pass
+
+
+def launchctl(*args):
+    return subprocess.run([LAUNCHCTL] + list(args), capture_output=True, text=True, timeout=30,
+                          env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"})
+
+
+def loaded():
+    return launchctl("print", "system/" + LABEL).returncode == 0
+
+
+def job_state():
+    """(running, last_exit) from `launchctl print system/<LABEL>`. A LaunchOnlyOnce job that has
+    exited is dropped from the system domain, so "not found" also means finished."""
+    out = launchctl("print", "system/" + LABEL)
+    if out.returncode != 0:
+        return False, "(unloaded after exit)"
+    running = bool(re.search(r"^\s*state = running\s*$", out.stdout, re.M))
+    m = re.search(r"^\s*last exit code = (.+)$", out.stdout, re.M)
+    return running, (m.group(1).strip() if m else None)
+
+
+def bootout():
+    if loaded():
+        launchctl("bootout", "system/" + LABEL)
+        for _ in range(50):
+            if not loaded():
+                break
+            time.sleep(0.1)
+
+
+def check_builder_file(st, mode=0o600):
+    """A file the runner (uid 470) created for root to read: regular, owned by 470, exactly one
+    link (a hardlink to some other file can't stand in for it), and the exact mode."""
+    return (stat.S_ISREG(st.st_mode) and st.st_uid == R.BUILDER_UID and st.st_nlink == 1
+            and stat.S_IMODE(st.st_mode) == mode)
+
+
+def read_result(job_dir):
+    """Open <job_dir>/result.json without following symlinks at either level, then fstat-check it."""
+    try:
+        dfd = os.open(job_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        dst = os.fstat(dfd)
+        if dst.st_uid != R.BUILDER_UID or not stat.S_ISDIR(dst.st_mode):
+            return None
+        fd = os.open("result.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+    except OSError:
+        return None
+    finally:
+        os.close(dfd)
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not check_builder_file(st) or st.st_size > MAX_RESULT:
+            return None
+        try:
+            obj = json.loads(f.read(MAX_RESULT).decode("utf-8"))
+        except Exception:
+            return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _dec(x, lo, hi):
+    return isinstance(x, str) and NUM_RE.fullmatch(x) is not None and str(int(x)) == x and lo <= int(x) <= hi
+
+
+def production_argv_ok(args):
+    if args in (["--sweep-only"], ["--cancel"]):
+        return True
+    return (len(args) == 6 and args[0] == "--timeout" and args[2] == "--disk-budget-mb" and args[4] == "--mem-budget-mb"
+            and _dec(args[1], 1, R.MAX_TIMEOUT) and int(args[1]) in TIMEOUT_TIERS
+            and _dec(args[3], 1, R.MAX_DISK_BUDGET_MB) and _dec(args[5], 1, R.MAX_MEM_BUDGET_MB))
+
+
+def cancel_inflight():
+    """`bh-dispatch --cancel` with the job id on stdin: if a dispatcher holds the lock for exactly that
+    job, SIGTERM it (it then cancels, sweeps and prints `cancelled` to its own caller). Only ever
+    signals the pid the in-flight dispatcher wrote into the root-owned lock file, after checking the
+    lock is held, the job id matches, and that pid is running /opt/borrowed-hands/bin/bh-dispatch."""
+    raw = sys.stdin.buffer.read(200)
+    job_id = raw.decode("utf-8", "replace").strip()
+    if not R.UUID4_RE.match(job_id):
+        fail("usage", "--cancel reads a job id (uuid4) on stdin")
+    try:
+        fd = os.open(LOCK, os.O_RDWR | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        fail("not_running", "no job is running", job_id=job_id)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        fail("not_running", "no job is running", job_id=job_id)
+    except BlockingIOError:
+        pass                                    # held: a dispatcher is in flight
+    os.lseek(fd, 0, os.SEEK_SET)
+    parts = os.read(fd, 200).decode("utf-8", "replace").split()
+    os.close(fd)
+    if len(parts) != 2 or not parts[0].isdigit() or int(parts[0]) <= 1:
+        fail("error", "lock file has no owner record", job_id=job_id)
+    pid, running = int(parts[0]), parts[1]
+    if running != job_id:
+        fail("not_running", "a different job is running", job_id=job_id)
+    def is_dispatcher():
+        r = subprocess.run(["/bin/ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
+                           timeout=10, env={"PATH": "/usr/bin:/bin"})
+        cmd = r.stdout.strip()
+        return r.returncode == 0 and (" " + DISPATCH_PATH + " ") in (" " + cmd + " ") and "--cancel" not in cmd
+    if not is_dispatcher():
+        fail("error", "lock owner is not a bh-dispatch process", job_id=job_id)
+    os.kill(pid, signal.SIGTERM)
+    sys.stdout.write(json.dumps({"v": 1, "status": "cancel_sent", "job_id": job_id}) + "\n")
+    return 0
+
+
+def test_mode():
+    try:
+        st = os.lstat(TEST_MODE_FLAG)
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(st.st_mode) and root_owned_chain(TEST_MODE_FLAG)
+
+
+def main(argv):
+    global R
+    if os.geteuid() != 0:
+        fail("usage", "bh-dispatch must run as root (via its sudoers rule)")
+    os.umask(0o022)
+    if R is None:          # (tests may inject an already-loaded runner module)
+        R = load_runner()
+    allow_file, profile_name, timeout = False, None, R.DEFAULT_TIMEOUT
+    budgets = []
+    keep_dirs = False
+    args = list(argv)
+    if not test_mode() and not production_argv_ok(args):
+        fail("usage", "production bh-dispatch takes exactly: --timeout {%s} --disk-budget-mb N --mem-budget-mb N "
+             "| --sweep-only | --cancel" % ",".join(map(str, TIMEOUT_TIERS)))
+    if args == ["--cancel"]:
+        return cancel_inflight()
+    if args == ["--sweep-only"]:
+        # used by teardown-bh-builder.sh: kill uid 470's processes from a uid-470 child
+        ok = sweep()
+        sys.stdout.write(json.dumps({"v": 1, "status": "swept" if ok else "error", "sweep_ok": ok}) + "\n")
+        return 0 if ok else 1
+    while args:
+        a = args.pop(0)
+        if a in ("--disk-budget-mb", "--mem-budget-mb") and args and NUM_RE.fullmatch(args[0]):
+            budgets += [a, args.pop(0)]
+        elif a == "--allow-file-remote":
+            allow_file = True
+        elif a == "--keep-build-dirs":    # test mode only: inspect the checkout after the job
+            keep_dirs = True
+        elif a == "--profile" and args:
+            profile_name = args.pop(0)
+        elif a == "--timeout" and args and NUM_RE.fullmatch(args[0]):
+            timeout = int(args.pop(0))
+        else:
+            fail("usage", "usage: bh-dispatch [--timeout S] [--disk-budget-mb N] [--mem-budget-mb N] < job.json")
+    bud = dict(zip(budgets[0::2], (int(x) for x in budgets[1::2])))
+    disk_budget = bud.get("--disk-budget-mb", R.DEFAULT_DISK_BUDGET_MB)
+    mem_budget = bud.get("--mem-budget-mb", R.DEFAULT_MEM_BUDGET_MB)
+    if not (1 <= disk_budget <= R.MAX_DISK_BUDGET_MB and 1 <= mem_budget <= R.MAX_MEM_BUDGET_MB):
+        fail("usage", "budget out of range")
+    if (allow_file or keep_dirs or profile_name is not None) and not test_mode():
+        fail("usage", "--profile, --allow-file-remote and --keep-build-dirs are test-mode only (%s absent)" % TEST_MODE_FLAG)
+    if not 1 <= timeout <= R.MAX_TIMEOUT:
+        fail("usage", "timeout out of range")
+    profile = LIBEXEC + "/builder.sb"
+    if profile_name is not None:
+        if not PROFILE_RE.match(profile_name):
+            fail("usage", "profile must be a plain name like builder.sb")
+        profile = LIBEXEC + "/profiles/" + profile_name
+    for p in (profile, LIBEXEC + "/git.sb", RUNNER, PLIST_DIR):
+        if not os.path.exists(p) or not root_owned_chain(p):
+            fail("error", "%s missing or not root-owned/read-only" % p)
+
+    raw = sys.stdin.buffer.read(R.MAX_JOB_JSON + 1)
+    try:
+        job = json.loads(raw.decode("utf-8")) if len(raw) <= R.MAX_JOB_JSON else None
+    except Exception:  # UnicodeDecodeError, ValueError, RecursionError
+        job = None
+    if not isinstance(job, dict) or not isinstance(job.get("job_id"), str):
+        fail("invalid_job", "job.json missing, too large or not an object")
+    job_dir = R.JOBS_ROOT + "/" + job["job_id"]
+    try:
+        R.validate_job(job, job["job_id"], allow_file)
+        if not R.UUID4_RE.match(job["job_id"]):
+            raise R.JobError("invalid_job", "job_id must be a uuid4")
+    except R.JobError as e:
+        fail(e.status, e.message)
+
+    lock_fd = os.open(LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fail("busy", "another job is running", job_id=job["job_id"])
+    os.ftruncate(lock_fd, 0)                     # owner record for `--cancel`
+    os.write(lock_fd, ("%d %s\n" % (os.getpid(), job["job_id"])).encode())
+
+    started = time.monotonic()
+    state = {"cancelled": False}
+
+    def on_signal(signum, frame):
+        state["cancelled"] = True
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, on_signal)
+
+    dispatch = {"label": LABEL, "domain": "system", "profile": os.path.basename(profile)}
+    bootout()                      # stale job from a crashed dispatcher (lock was free)
+    dispatch["pre_sweep_ok"] = sweep()
+    if not dispatch["pre_sweep_ok"]:
+        fail("error", "could not clear leftover bh-builder processes; refusing to start", job_id=job["job_id"],
+             dispatch=dispatch)
+    try:
+        dispatch["retention_removed"] = prune_job_dirs(job["job_id"])
+    except OSError:
+        dispatch["retention_removed"] = -1
+    if os.path.lexists(job_dir) or not make_job_dir(job_dir, job):
+        fail("invalid_job", "job dir exists or could not be created", job_id=job["job_id"])
+    try:
+        runner_err = create_runner_err(job_dir)
+    except OSError as e:
+        fail("error", "job dir check failed: %s" % e, job_id=job["job_id"])
+    # Budgets are enforced here, as root, independently of bh-runner (which runs as the same uid
+    # as the build). Disk: free-space delta of the data volume since job start (statvfs sees
+    # unlinked-but-open files that du can't) plus an absolute free-space floor. Memory: summed RSS
+    # of uid 470. Both fail closed if they can't be measured.
+    try:
+        free_start = free_mb(R.JOBS_ROOT)
+    except OSError as e:
+        fail("error", "statvfs failed: %s" % e, job_id=job["job_id"])
+    if free_start < FREE_FLOOR_MB:
+        fail("disk_budget", "only %d MB free on the build volume (floor %d MB)" % (free_start, FREE_FLOOR_MB),
+             job_id=job["job_id"])
+    dispatch["free_mb_at_start"] = free_start
+
+    argv = ["/usr/bin/python3", "-I", RUNNER]
+    if allow_file:
+        argv.append("--allow-file-remote")
+    argv += ["--profile", profile, "--timeout", str(timeout)] + budgets + [job_dir]
+    plist = {
+        "Label": LABEL,
+        "ProgramArguments": argv,
+        "UserName": R.BUILDER_USER,
+        "GroupName": R.BUILDER_USER,
+        "InitGroups": False,
+        "SessionCreate": True,
+        "RunAtLoad": True,
+        "KeepAlive": False,
+        "LaunchOnlyOnce": True,
+        "AbandonProcessGroup": False,
+        "WorkingDirectory": job_dir,
+        "StandardInPath": "/dev/null",
+        "StandardOutPath": "/dev/null",
+        "StandardErrorPath": runner_err,
+        "EnvironmentVariables": {"HOME": R.BUILDER_HOME, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+        "SoftResourceLimits": {"NumberOfProcesses": NPROC_LIMIT, "NumberOfFiles": NOFILE_LIMIT},
+        "HardResourceLimits": {"NumberOfProcesses": NPROC_LIMIT, "NumberOfFiles": NOFILE_LIMIT},
+        "ProcessType": "Standard",
+    }
+    tmp = PLIST + ".tmp"
+    with open(tmp, "wb") as f:
+        plistlib.dump(plist, f)
+    os.chmod(tmp, 0o644)
+    os.rename(tmp, PLIST)
+
+    status = None
+    try:
+        r = launchctl("bootstrap", "system", PLIST)
+        if r.returncode != 0:
+            status = ("error", "launchctl bootstrap failed: %s" % (r.stderr.strip() or r.stdout.strip())[:300])
+        else:
+            deadline = time.monotonic() + timeout + EXTRA_WAIT
+            seen_running = False
+            measure_failures = 0
+            while True:
+                if state["cancelled"]:
+                    status = ("cancelled", "job cancelled")
+                    break
+                if time.monotonic() > deadline:
+                    status = ("timeout", "runner did not finish within timeout + %ss" % EXTRA_WAIT)
+                    break
+                try:
+                    free_now = free_mb(R.JOBS_ROOT)
+                    rss = builder_rss_mb()
+                    measure_failures = 0
+                except (OSError, subprocess.SubprocessError) as e:
+                    # a fork failure (EAGAIN) is transient; three in a row fails the job closed
+                    measure_failures += 1
+                    if measure_failures >= 3:
+                        status = ("budget_check_failed", "dispatcher could not measure the job: %s" % str(e)[:200])
+                        break
+                    time.sleep(POLL_S)
+                    continue
+                used = free_start - free_now
+                dispatch["max_disk_used_mb"] = max(dispatch.get("max_disk_used_mb", 0), used)
+                if used > disk_budget or free_now < FREE_FLOOR_MB:
+                    status = ("disk_budget", "dispatcher (statvfs): volume free space fell by %d MB (budget %d MB), "
+                              "%d MB free (floor %d MB)" % (used, disk_budget, free_now, FREE_FLOOR_MB))
+                    break
+                if rss > mem_budget:
+                    status = ("memory_budget", "dispatcher: bh-builder processes use %d MB RSS (budget %d MB)"
+                              % (rss, mem_budget))
+                    break
+                try:
+                    running, last_exit = job_state()
+                except (OSError, subprocess.SubprocessError):
+                    time.sleep(POLL_S)          # e.g. fork EAGAIN; the deadline still applies
+                    continue
+                seen_running = seen_running or running
+                if not running and last_exit is not None and last_exit != "(never exited)":
+                    dispatch["launchd_last_exit"] = last_exit
+                    break
+                time.sleep(POLL_S)
+            if state["cancelled"] and status is None:
+                status = ("cancelled", "job cancelled")
+    except (OSError, subprocess.SubprocessError) as e:
+        status = ("error", "dispatcher error while the job ran: %s" % str(e)[:200])
+    finally:
+        teardown(dispatch)
+
+    if not dispatch["post_sweep_ok"]:
+        # Something of uid 470 outlived teardown: nothing it could have touched is trusted.
+        status = ("error", "post-job sweep failed; result.json ignored")
+    result = read_result(job_dir) if status is None or status[0] != "error" else None
+    if status is not None and status[0] in ("cancelled", "timeout", "disk_budget", "memory_budget", "budget_check_failed"):
+        result = {"v": 1, "status": status[0], "message": status[1], "job_id": job["job_id"]}
+    elif result is None:
+        result = {"v": 1, "status": status[0] if status else "error",
+                  "message": status[1] if status else "runner produced no result (see runner.err)",
+                  "job_id": job["job_id"]}
+    # Free the job's disk now: everything but logs/, job.json, result.json, runner.err. Done as
+    # uid 470 (the files' owner), clearing BSD flags and modes first.
+    def clean_job():
+        return all([R.remove_tree(os.path.join(job_dir, d)) for d in JOB_SCRATCH_DIRS])
+    if keep_dirs:
+        dispatch["job_dirs_removed"] = "kept (test mode)"
+    elif not dispatch["post_sweep_ok"]:
+        # A uid-470 process may still be alive and racing the deleter; leave the dirs for the
+        # next job's pre-sweep and the operator.
+        dispatch["job_dirs_removed"] = "skipped (post-job sweep failed)"
+    else:
+        try:
+            dispatch["job_dirs_removed"] = retry(lambda: as_builder(clean_job) == 0)
+        except Exception:
+            dispatch["job_dirs_removed"] = False
+    result["dispatch"] = dispatch
+    result["dispatch_duration_s"] = round(time.monotonic() - started, 2)
+    sys.stdout.write(json.dumps(result, sort_keys=True) + "\n")
+    sys.stdout.flush()
+    return 0 if result.get("status") == "succeeded" else 1
+
+
+R = None
+if __name__ == "__main__":
+    try:
+        rc = main(sys.argv[1:])
+    except SystemExit:
+        raise
+    except BaseException as e:   # never exit without the one JSON line
+        sys.stdout.write(json.dumps({"v": 1, "status": "error",
+                                     "message": "dispatcher crashed: %s: %s" % (type(e).__name__, str(e)[:300])}) + "\n")
+        sys.stdout.flush()
+        rc = 1
+    sys.exit(rc)

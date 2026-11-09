@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://borrowed-hands.dev/protocol/v1/envelope.json",
+  "title": "Frame envelope. 's' is required for every frame after auth_ok/pair_ok (PROTOCOL 2.1, 2.2).",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "p": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "s": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{86}$"
+    }
+  },
+  "required": [
+    "v",
+    "p"
+  ],
+  "additionalProperties": false
+}

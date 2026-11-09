@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://borrowed-hands.dev/protocol/v1/params-system-info.json",
+  "title": "contract params for system.info",
+  "type": "object",
+  "properties": {},
+  "required": [],
+  "additionalProperties": false
+}

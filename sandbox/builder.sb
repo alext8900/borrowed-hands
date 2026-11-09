@@ -1,0 +1,92 @@
+(version 1)
+;; Borrowed Hands build profile (sandbox-exec), applied by bh-runner to xcodebuild and to
+;; xcresulttool. The process tree already runs as bh-builder (uid 470) inside a system-domain
+;; launchd job with its own session (bh-dispatch), so uid separation stops other users' private
+;; files. This profile stops what uid can't: world-readable data, network, IPC to system services,
+;; writes outside the job, and launchd/GUI side doors.
+;; Params (from bh-runner): JOB, USER_TMP, USER_CACHE, BUILDER_HOME, DEVELOPER_DIR.
+;; Verified on macOS 27.2 / Xcode 27.2 with tests/run-tests.sh (see docs/SANDBOX.md).
+(allow default)
+
+;; ---- signals: only within this sandbox (xcodebuild and its children). The runner, launchd's
+;; agents and every other bh-builder process are the same uid but outside the sandbox: the build
+;; must not be able to SIGSTOP/SIGKILL the runner or its du/ps budget checks.
+(deny signal)
+(allow signal (target same-sandbox))
+
+;; ---- network: none (no TCP/UDP, no unix-socket connects, no new sockets at all)
+(deny network*)
+(deny system-socket)
+
+;; ---- writes: only the job's own build dirs and the builder's per-user temp/cache dirs
+;; (both wiped by bh-runner after every job). Not JOB itself: logs/ and result.json are the
+;; runner's, and the build must not be able to forge them.
+(deny file-write*)
+(allow file-write*
+  (subpath (string-append (param "JOB") "/src"))
+  (subpath (string-append (param "JOB") "/dd"))
+  (subpath (string-append (param "JOB") "/tmp"))
+  (subpath (string-append (param "JOB") "/home"))
+  (subpath (string-append (param "JOB") "/result.xcresult"))
+  (subpath (param "USER_TMP")) (subpath (param "USER_CACHE"))
+  (literal "/dev/null") (literal "/dev/tty") (literal "/dev/dtracehelper") (regex #"^/dev/fd/"))
+
+;; ---- no BSD flags (chflags uchg/schg) and no ACLs: a build must not be able to make its files
+;; undeletable by the runner/dispatcher cleanup or hide them behind deny ACEs.
+(deny file-write-flags file-write-acl)
+
+;; ---- reads: allowlist. Metadata (stat/lstat/readlink) stays allowed everywhere: path lookup
+;; needs it, and it reveals names/sizes of paths you already know, not contents or listings.
+(deny file-read*)
+(allow file-read-metadata)
+(allow file-read*
+  (literal "/")
+  (subpath "/System") (subpath "/usr") (subpath "/bin") (subpath "/sbin")
+  (subpath "/Applications/Xcode.app")
+  (subpath "/Library/Developer")          ; CoreSimulator/CoreDevice frameworks xcodebuild loads
+  (subpath "/Library/Apple")              ; RemotePairing framework
+  (subpath "/private/var/db/timezone") (subpath "/private/var/db/dyld")
+  (literal "/private/etc/localtime") (literal "/private/etc/protocols") (literal "/private/etc/services")
+  (literal "/Library/Preferences/.GlobalPreferences.plist")
+  (literal "/Library/Preferences/com.apple.dt.Xcode.plist")
+  (subpath "/Library/Preferences/Logging")
+  (subpath "/dev")
+  (subpath (param "JOB"))
+  (subpath (param "USER_TMP")) (subpath (param "USER_CACHE")))
+
+;; ---- mach services: none. This is the boundary for keychain (SecurityServer/securityd),
+;; Launch Services (open), Apple Events (osascript), pasteboard, DiskArbitration (hdiutil),
+;; nsurlsessiond/networkd (network by proxy), cfprefsd (reads of other prefs by proxy),
+;; opendirectoryd (user enumeration), and anything else reachable over XPC.
+;; Discovery found 7 services xcodebuild/swift-frontend/ld look up (opendirectoryd.libinfo and
+;; .membership, bsd.dirhelper, logd, notification_center, distributed_notifications, cfprefsd);
+;; denying every one of them still builds the sample and hostile apps (docs/SANDBOX.md, "Mach
+;; services"). Local Swift packages need bsd.dirhelper (below). If a project needs another one,
+;; add exactly that global-name here with evidence.
+(deny mach-lookup)
+;; The one exception: bsd.dirhelper answers confstr(DARWIN_USER_TEMP_DIR/CACHE_DIR)
+;; for this uid only. Without it SwiftPM falls back to /private/tmp for its manifest work dir and
+;; every local-path package fails with "permissionDenied" (the remote-dependency refusal tells agents to vendor packages as
+;; local path packages, so those must build). It returns paths this profile already allows.
+(allow mach-lookup (global-name "com.apple.bsd.dirhelper"))
+
+;; ---- no hardware / IOKit user clients
+(deny iokit-open)
+;; ---- no machine identifiers or network state: serial number, platform UUID, MAC addresses via
+;; IOKit properties, and every net.* sysctl (netstat's socket/peer tables, interface lists).
+;; kern.hostname stays readable (build tools print it).
+(deny iokit-get-properties (iokit-property "IOPlatformSerialNumber" "IOPlatformUUID" "IOMACAddress"))
+(deny sysctl-read (sysctl-name-prefix "net."))
+
+;; ---- no POSIX or System V IPC (shared memory / semaphores are channels outside the file rules)
+(deny ipc-posix-shm* ipc-posix-sem* ipc-sysv*)
+
+;; ---- defense in depth: tools a build never needs. Bypassable by copying the binary (the probe
+;; suite does exactly that); the mach and file rules above are the real boundary.
+(deny process-exec
+  (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/bin/launchctl")
+  (literal "/usr/bin/security") (literal "/usr/bin/hdiutil") (literal "/usr/sbin/screencapture")
+  (literal "/usr/bin/pbcopy") (literal "/usr/bin/pbpaste") (literal "/usr/bin/sudo")
+  (literal "/usr/bin/su") (literal "/usr/bin/login") (literal "/usr/bin/ssh") (literal "/usr/bin/scp")
+  (literal "/usr/bin/curl") (literal "/usr/bin/nc") (literal "/usr/bin/dscl")
+  (literal "/usr/bin/defaults") (literal "/usr/sbin/systemsetup") (literal "/usr/bin/tccutil"))

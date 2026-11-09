@@ -1,0 +1,63 @@
+(version 1)
+;; Borrowed Hands: profile for the git materialization step (bh-runner), run as bh-builder.
+;; Default deny. git (Xcode's) and its helpers may run; they may read system libraries and the
+;; job dir, write only the job dir and per-user temp/cache, resolve names, and connect out on
+;; TCP 443 only. Hooks/filters/config/submodules are already disabled on git's command line.
+;; Params: JOB, USER_TMP, USER_CACHE, BUILDER_HOME, DEVELOPER_DIR.
+(deny default)
+
+;; ---- processes: exactly git and the helpers a fetch/checkout uses. Over https: git and
+;; git-remote-https (git-core/git is the same binary git re-execs for builtins). The file://
+;; transport (git-upload-pack, run through /bin/sh) is allowed only in test mode
+;; (BH_TEST_FILE_REMOTE=1, which bh-runner sets only for a file:// remote, which bh-dispatch only
+;; accepts while /opt/borrowed-hands/TEST_MODE exists).
+(allow process-fork)
+(allow process-exec
+  (literal (string-append (param "DEVELOPER_DIR") "/usr/bin/git"))
+  (literal (string-append (param "DEVELOPER_DIR") "/usr/libexec/git-core/git"))
+  (literal (string-append (param "DEVELOPER_DIR") "/usr/libexec/git-core/git-remote-https"))
+  (literal (string-append (param "DEVELOPER_DIR") "/usr/libexec/git-core/git-remote-http")))
+(if (equal? (param "BH_TEST_FILE_REMOTE") "1")
+  (allow process-exec
+    (literal "/bin/sh") (literal "/bin/bash")   ; /bin/sh re-execs bash
+    (literal (string-append (param "DEVELOPER_DIR") "/usr/libexec/git-core/git-upload-pack"))
+    (literal (string-append (param "DEVELOPER_DIR") "/usr/bin/git-upload-pack"))))
+(allow signal (target same-sandbox))
+(allow process-info* (target same-sandbox))
+(allow sysctl-read)
+
+;; ---- reads: system libraries, Xcode, TLS trust material, the job
+(allow file-read-metadata)
+(allow file-read*
+  (literal "/")
+  (subpath "/System") (subpath "/usr/lib") (subpath "/usr/share") (subpath "/bin") (subpath "/usr/bin")
+  (subpath "/Applications/Xcode.app")
+  (subpath "/private/var/db/dyld") (subpath "/private/var/db/timezone")
+  (literal "/private/etc/localtime") (subpath "/private/etc/ssl")
+  (literal "/private/var/run/resolv.conf")
+  (literal "/dev/null") (literal "/dev/random") (literal "/dev/urandom") (literal "/dev/dtracehelper")
+  (subpath (param "JOB")) (subpath (param "USER_TMP")) (subpath (param "USER_CACHE")))
+;; file:// remotes exist only in test mode; they are staged under /private/tmp/bh-stage-*.
+(if (equal? (param "BH_TEST_FILE_REMOTE") "1")
+  (allow file-read* (regex #"^/private/tmp/bh-stage-[A-Za-z0-9]+(/|$)")))
+
+;; ---- writes: the job and per-user temp/cache only
+(allow file-write*
+  (subpath (param "JOB")) (subpath (param "USER_TMP")) (subpath (param "USER_CACHE"))
+  (literal "/dev/null") (literal "/dev/dtracehelper"))
+(allow file-ioctl (literal "/dev/null") (literal "/dev/dtracehelper"))
+
+;; ---- network: DNS via mDNSResponder, then TCP 443 out only
+(allow network-outbound
+  (literal "/private/var/run/mDNSResponder")
+  (remote tcp "*:443"))
+(allow system-socket)
+
+;; ---- mach services: name resolution (libinfo, DNSConfiguration), TLS trust evaluation (trustd)
+;; and os_log (logd, write-only). notification_center and dirhelper were dropped in fix round 2:
+;; fetch + worktree + checkout over https work without them (denials logged, no failure).
+(allow mach-lookup
+  (global-name "com.apple.system.opendirectoryd.libinfo")
+  (global-name "com.apple.SystemConfiguration.DNSConfiguration")
+  (global-name "com.apple.trustd") (global-name "com.apple.trustd.agent")
+  (global-name "com.apple.logd"))

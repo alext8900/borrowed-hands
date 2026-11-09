@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://borrowed-hands.dev/protocol/v1/params-xcode-build.json",
+  "title": "contract params for xcode.build",
+  "type": "object",
+  "properties": {
+    "workspace_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+    },
+    "repo_fingerprint": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "scheme": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9 ._+-]{0,63}$"
+    },
+    "configuration": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9 ._+-]{0,63}$"
+    },
+    "destination": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    }
+  },
+  "required": [
+    "commit",
+    "configuration",
+    "destination",
+    "repo_fingerprint",
+    "scheme",
+    "workspace_id"
+  ],
+  "additionalProperties": false
+}

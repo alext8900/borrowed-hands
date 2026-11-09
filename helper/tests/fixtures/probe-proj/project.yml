@@ -1,0 +1,23 @@
+name: Probe
+options:
+  bundleIdPrefix: com.example.probe
+  deploymentTarget:
+    macOS: "14.0"
+targets:
+  Probe:
+    type: application
+    platform: macOS
+    sources: [Sources]
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.probe.app
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+    preBuildScripts:
+      - name: ProbeScript
+        script: |
+          echo "PROBE whoami=$(whoami) uid=$(id -u)"
+          if test -d "$HOME/.ssh"; then echo "PROBE ssh_dir=exists"; else echo "PROBE ssh_dir=absent"; fi
+          echo "PROBE home_entries=$(ls -A "$HOME" 2>&1 | wc -l | tr -d ' ')"
+          echo "marker $(date)" > "${PROBE_MARKER_DIR:-$SRCROOT/..}/x3-marker.txt" && echo "PROBE marker_write=ok" || echo "PROBE marker_write=FAILED"
+        basedOnDependencyAnalysis: false
