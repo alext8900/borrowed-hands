@@ -222,7 +222,9 @@ interface check. The self-test is local; the end-to-end check is a build request
 
 See the [complete checklist](QUICKSTART.md#uninstall). In short: `bh uninstall` on the Mac (it stops the helper
 first and removes nothing while one still runs, verifies each removal, and lists anything left or uncheckable with
-the exact command), then `uv tool uninstall borrowed-hands-helper`; on Hermes,
+the exact command; the empty, macOS-protected per-user folders under `/private/var/folders`, owned by uid 470 once
+the account is gone, are reported as `ok` with a note because nobody can remove them), then
+`uv tool uninstall borrowed-hands-helper`; on Hermes,
 `/hands unpair` each Mac, then delete the Railway service and volume, or stop the gateway and remove the plugin and
 only its own data directory.
 

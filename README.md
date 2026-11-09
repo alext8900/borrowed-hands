@@ -97,7 +97,9 @@ This is containment with residual risks, not a blanket safety guarantee. A stole
 
 On the Mac, `bh uninstall` stops the helper first, removes everything it installed, verifies each removal and
 prints a checklist; anything left over or impossible to check is listed with the exact command to run. It never
-removes an account, home or caches it cannot verify as its own. Then `uv tool uninstall borrowed-hands-helper`. On
+removes an account, home or caches it cannot verify as its own. macOS keeps a few empty, protected per-user folders
+for the build user under `/private/var/folders` that not even root can delete; they stay, owned by uid 470, and the
+checklist notes them as nothing to do. Then `uv tool uninstall borrowed-hands-helper`. On
 Hermes, `/hands unpair` each Mac, then remove the plugin or the Railway service and volume. The complete checklist
 for both sides, with paths, is in [docs/QUICKSTART.md](docs/QUICKSTART.md#uninstall).
 

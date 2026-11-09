@@ -18,7 +18,7 @@ from typing import Optional
 from . import __version__, account, config, keyfile
 from ._shared import SANDBOX
 from .config import ACTIONS, ConfigError, Workspace
-from .env import Env, show
+from .env import Env, describe_unsafe, paste_command, show
 from .jobstore import JobStore
 
 DB = "jobs.sqlite3"
@@ -231,12 +231,18 @@ RUNNER_JOB = "system/com.borrowedhands.runner"
 LOGS = "~/Library/Logs/BorrowedHands"
 
 
+def cmd(argv: list[str], sudo: bool = False) -> str:
+    """A command the user copies and runs: shell-quoted, or a description when a path in it is unsafe to paste."""
+    return paste_command(argv, sudo) or describe_unsafe(argv)
+
+
 def uninstall_checklist(env: Env) -> list[tuple[str, str, str]]:
     """(what, state, next step) for everything Borrowed Hands puts on this Mac, checked after removal so a success
-    report is a verified one (audit #6). state is "ok" (verifiably gone), "LEFT" (still there) or "UNKNOWN" (the
-    check itself failed, which never counts as removed)."""
+    report is a verified one (audit #6). state is "ok" (verifiably gone), "ok-note" (only what macOS keeps and
+    nobody can remove is left; the step is the note), "LEFT" (still there) or "UNKNOWN" (the check itself failed,
+    which never counts as removed)."""
     from . import service
-    teardown = f"sudo bash '{SANDBOX / 'teardown-bh-builder.sh'}'"
+    teardown = cmd(["bash", str(SANDBOX / "teardown-bh-builder.sh")], sudo=True)
     agent = f"gui/{env.uid}/{service.LABEL}"
     plist = service.plist_path(env.user_home)
 
@@ -245,19 +251,19 @@ def uninstall_checklist(env: Env) -> list[tuple[str, str, str]]:
         rc = env.run(argv)[0]
         st = service.launchd_state(rc)
         return (("ok", fix) if st is False else ("LEFT", fix) if st else
-                ("UNKNOWN", f"could not check (exit {rc}); check with: {' '.join(argv)}"))
+                ("UNKNOWN", f"could not check (exit {rc}); check with: {cmd(argv)}"))
 
     def record(kind: str, name: str) -> tuple[str, str]:
         argv = ["/usr/bin/dscl", ".", "-list", f"/{kind}"]
         rc, out = env.run(argv)
         if rc != 0:
-            return "UNKNOWN", f"could not check (exit {rc}); check with: {' '.join(argv)}"
+            return "UNKNOWN", f"could not check (exit {rc}); check with: {cmd(argv)}"
         return ("LEFT" if name in out.split() else "ok"), teardown
 
     def path(p: str, fix: str) -> tuple[str, str]:
         st = env.exists(p)
         return (("ok", fix) if st is False else ("LEFT", fix) if st else
-                ("UNKNOWN", f"could not check; check with: ls -ld '{p}'"))
+                ("UNKNOWN", f"could not check; check with: {cmd(['ls', '-ld', p])}"))
 
     def caches(teardown_cmd: str) -> tuple[str, str]:
         """Inspected on every run, so a retry cannot inherit success from an earlier failed or skipped cleanup."""
@@ -272,7 +278,7 @@ def uninstall_checklist(env: Env) -> list[tuple[str, str, str]]:
         rc, out = env.run(argv)
         if rc != 0:
             return "UNKNOWN", (f"could not check the user accounts (exit {rc}), so these folders were not touched; "
-                               f"check with: {' '.join(argv)}")
+                               f"check with: {cmd(argv)}")
         rows = [line.split() for line in out.splitlines() if line.split()]
         if any(r[0] == "bh-builder" for r in rows):
             return "LEFT", teardown_cmd        # the account still exists: teardown verifies it and removes them
@@ -280,7 +286,16 @@ def uninstall_checklist(env: Env) -> list[tuple[str, str, str]]:
         if holders:
             return "UNKNOWN", (f"uid {BUILDER_UID} belongs to another account ({', '.join(holders)}); these folders "
                                f"are its files and were not touched")
-        return "LEFT", "sudo rm -rf " + " ".join(f"'{p}'" for p in found)
+        # macOS keeps a per-user skeleton here that root cannot remove (sunlnk dirs): never offer rm for it
+        removable = env.cache_removable(found, BUILDER_UID)
+        if removable is None:
+            return "UNKNOWN", f"could not check what is left in them; check with: {cmd(['ls', '-lRO', *found], True)}"
+        if not removable:
+            return "ok-note", (f"left by macOS (protected per-user folders, nothing removable left): "
+                               f"{', '.join(found)}; macOS removes or reuses these; nothing to do")
+        # The account is gone, so the teardown can no longer authorize this; names below T/ were chosen by build
+        # code, so the command is quoted, or not shown at all for a name with control characters.
+        return "LEFT", cmd(["rm", "-rf", *removable], sudo=True)
 
     def paths(ps: tuple, fix: str) -> tuple[str, str]:
         states = [path(p, fix) for p in ps]
@@ -288,16 +303,16 @@ def uninstall_checklist(env: Env) -> list[tuple[str, str, str]]:
                     next((s for s in states if s[0] == "UNKNOWN"), ("ok", fix)))
     return [
         ("background helper stopped", *launchd(agent, f"launchctl bootout {agent}")),
-        (f"LaunchAgent removed ({plist})", *path(str(plist), f"rm '{plist}'")),
+        (f"LaunchAgent removed ({plist})", *path(str(plist), cmd(["rm", str(plist)]))),
         (f"pairing, device key, grants and job history removed ({env.home})",
-         *path(str(env.home), f"rm -rf '{env.home}'")),
+         *path(str(env.home), cmd(["rm", "-rf", str(env.home)]))),
         ("build runner stopped", *launchd(RUNNER_JOB, f"sudo launchctl bootout {RUNNER_JOB}")),
         (f"build sandbox removed ({SANDBOX_PREFIX})", *path(SANDBOX_PREFIX, teardown)),
         ("bh-builder user removed", *record("Users", "bh-builder")),
         ("bh-builder group removed", *record("Groups", "bh-builder")),
         (f"build user home removed ({BUILDER_HOME})", *path(BUILDER_HOME, teardown)),
         (f"build user caches removed (uid {BUILDER_UID} under /private/var/folders)", *caches(teardown)),
-        (f"sudo rule removed ({SUDOERS_FILES[0]})", *paths(SUDOERS_FILES, "sudo rm -f " + " ".join(SUDOERS_FILES))),
+        (f"sudo rule removed ({SUDOERS_FILES[0]})", *paths(SUDOERS_FILES, cmd(["rm", "-f", *SUDOERS_FILES], True))),
     ]
 
 
@@ -307,9 +322,9 @@ def _report(env: Env, steps: tuple = ()) -> int:
     checklist = uninstall_checklist(env) + list(steps)
     env.say("Removal check:")
     for what, state, step in checklist:
-        env.say(f"  ok      {what}" if state == "ok" else
+        env.say(f"  ok      {what}" if state == "ok" else f"  ok      {what}; {step}" if state == "ok-note" else
                 f"  LEFT    {what}; remove it with: {step}" if state == "LEFT" else f"  UNKNOWN {what}; {step}")
-    left = [c for c in checklist if c[1] != "ok"]
+    left = [c for c in checklist if c[1] not in ("ok", "ok-note")]
     if left:
         env.err(f"{len(left)} item(s) remain or could not be checked. Run the commands shown, or fix the error "
                 f"above and run 'bh uninstall' again. Keep the helper installed until this passes: the teardown "
@@ -344,7 +359,7 @@ def cmd_uninstall(env: Env) -> int:
                "sudo rule? [y/N] ").strip().lower() not in ("y", "yes"):
         env.say("Nothing removed.")
         return 1
-    ok, msg = env.svc().uninstall(user_home=env.user_home, uid=env.uid, run=env.run)
+    ok, msg = env.svc().uninstall(user_home=env.user_home, uid=env.uid, run=env.run, say=env.say)
     (env.say if ok else env.err)(f"  {msg}")
     # Fence: nothing below may run under a live helper. It could be mid-build, and removing the sandbox, the
     # sudo rule or its state would take away its own cancel and sweep authority (R4).
@@ -402,7 +417,7 @@ def main(argv: Optional[list] = None, env: Optional[Env] = None) -> int:
         if a.cmd == "run":
             return cmd_run(env)
         if a.cmd == "service":
-            ok, msg = env.svc().install() if a.action == "install" else env.svc().uninstall()
+            ok, msg = env.svc().install() if a.action == "install" else env.svc().uninstall(say=env.say)
             (env.say if ok else env.err)(msg)
             return 0 if ok else 1
         if a.cmd == "status":

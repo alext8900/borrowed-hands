@@ -91,8 +91,63 @@ def uid_folders(uid: int, root: str = "/private/var/folders") -> Optional[list[s
     return sorted(found)
 
 
+SF_NOUNLINK = 0x00100000      # <sys/stat.h>; macOS sets it (SIP-enforced) on its per-user folder skeleton
+
+
+def removable_entries(roots: list, uid: int, lstat: Callable = os.lstat,
+                      listdir: Callable = os.listdir) -> Optional[list[str]]:
+    """The top-most paths under `roots` (uid's per-user folders) that are not macOS's protected skeleton, which no
+    one can remove: directories owned by `uid` with SF_NOUNLINK, and data vaults inside them that the kernel will
+    not let anyone stat (EPERM). [] if only that skeleton is left; None if something could not be inspected.
+    lstat only: a symlink is reported, never followed. Run as the owner, folders only uid and root can read (T,
+    C: 0700) are not looked into; the root teardown checks them before it deletes the account, so the checklist
+    trusts this only once the account is gone."""
+    import errno
+    import stat
+    found: list[str] = []
+
+    def walk(p: str, top: bool) -> bool:
+        try:
+            st = lstat(p)
+        except FileNotFoundError:
+            return True
+        except OSError as e:
+            return e.errno == errno.EPERM and not top
+        if not (stat.S_ISDIR(st.st_mode) and st.st_uid == uid and st.st_flags & SF_NOUNLINK):
+            found.append(p)
+            return True
+        try:
+            names = listdir(p)
+        except OSError as e:
+            return e.errno == errno.EACCES
+        return all(walk(os.path.join(p, n), False) for n in sorted(names))
+    return found if all(walk(r, True) for r in roots) else None
+
+
+def _unsafe_to_paste(word: str) -> bool:
+    """Control, format (bidi overrides, zero-width) and line/paragraph separator characters: in a pasted command a
+    newline runs a second command, and the others can make a command look like something it is not."""
+    import unicodedata
+    return any(unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in word)
+
+
+def paste_command(argv: list[str], sudo: bool = False) -> Optional[str]:
+    """A command line for the user to copy and run, every word shell-quoted; None if any word cannot be shown
+    safely (see _unsafe_to_paste). Paths in it can come from build code (uid 470's file names), never trust them."""
+    if any(_unsafe_to_paste(a) for a in argv):
+        return None
+    return " ".join(shlex.quote(a) for a in (["sudo", *argv] if sudo else argv))
+
+
+def describe_unsafe(argv: list[str]) -> str:
+    """What to say instead of a command paste_command refused: the offending words escaped, never raw."""
+    bad = [a for a in argv if _unsafe_to_paste(a)]
+    return ("no command shown: a path in it contains control characters (" + ", ".join(ascii(a) for a in bad)
+            + "); inspect it with ls -b and remove it by hand")
+
+
 def show(argv: list[str]) -> str:
-    return "sudo " + " ".join(shlex.quote(a) for a in argv)
+    return paste_command(argv, sudo=True) or describe_unsafe(argv)
 
 
 @dataclass
@@ -121,6 +176,7 @@ class Env:
     exists: Callable[[str], Optional[bool]] = lambda p: path_state(p)   # uninstall checks; None = cannot tell
     helper_running: Callable[[Path], Optional[bool]] = lambda home: helper_lock_state(home)   # None: cannot tell
     cache_dirs: Callable[[int], Optional[list]] = lambda uid: uid_folders(uid)       # uninstall's cache check
+    cache_removable: Callable[[list, int], Optional[list]] = lambda roots, uid: removable_entries(roots, uid)
     stop_wait_s: float = 130.0                # the LaunchAgent's ExitTimeOut (120 s to drain a build) plus margin
 
     def probes(self, policy) -> capsmod.Probes:

@@ -221,7 +221,12 @@ build sandbox, the `bh-builder` user and the sudo rule, then **checks each item*
 
 Any `LEFT` or `UNKNOWN` item makes the command exit nonzero. The teardown only removes a `bh-builder` account,
 group, home and caches it can verify are Borrowed Hands' own (uid and gid 470 with the attributes setup gives
-them). If another account already uses uid 470 or that home, its data is left in place and reported. When it
+them). If another account already uses uid 470 or that home, its data is left in place and reported.
+
+Once the build user has run a build, macOS keeps a few empty per-user folders for it under `/private/var/folders`
+that carry a system flag (`sunlnk`) not even root can override. The teardown removes everything else in them and
+the checklist shows these as `ok` with a `left by macOS` note: there is nothing to do, and `rm` cannot remove them.
+After the account is deleted they show owner `470` instead of `bh-builder`; macOS removes or reuses them. When it
 reports `Uninstalled and verified`, finish with:
 
 ```sh

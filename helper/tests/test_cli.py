@@ -47,7 +47,7 @@ class FakeService:
         self.calls.append("install")
         return True, "installed"
 
-    def uninstall(self, user_home=None, uid=None, run=None):
+    def uninstall(self, user_home=None, uid=None, run=None, say=None):
         self.calls.append("uninstall")
         return self.stop_result
 
@@ -73,6 +73,7 @@ class World:
         self.unknown_paths: set = set()         # paths whose existence cannot be checked (e.g. EACCES)
         self.running = False                    # a helper process still holds the lock (LaunchAgent or bh run)
         self.caches = []                        # uid 470's dirs under /private/var/folders; None: cannot scan
+        self.cache_left = None                  # what in them is not macOS's protected skeleton; None: all of it
         self.other_users: dict = {}             # other accounts: name -> UniqueID value(s)
         self.xc = xcode
         self.xdiag = xcode_diag or NOT_INSTALLED
@@ -90,7 +91,9 @@ class World:
                        host=lambda: Host("26.2", "arm64"),
                        timing=FAST, executors={"system.info": object(), "xcode.build": FakeBuild()}, uid=501,
                        service=self.svc, helper_running=lambda home: self.running, stop_wait_s=0,
-                       cache_dirs=lambda uid: self.caches)
+                       cache_dirs=lambda uid: self.caches,
+                       cache_removable=lambda roots, uid: list(roots) if self.cache_left is None else
+                       (None if self.cache_left == "unknown" else self.cache_left))
 
     def _ask(self, prompt):
         self.out.append(f"? {prompt}")
@@ -231,13 +234,73 @@ def test_service_plist(tmp_path):
 
 def test_service_uninstall_reports_a_helper_that_is_still_loaded(tmp_path):
     target = "gui/501/dev.borrowed-hands.helper"
-    ok, msg = service.uninstall(tmp_path, uid=501, run=lambda a: (0, "") if a[1] == "print" else (5, ""))
+    now = [0.0]
+    fast = {"clock": lambda: now[0], "sleep": lambda s: now.__setitem__(0, now[0] + s)}
+    ok, msg = service.uninstall(tmp_path, uid=501, run=lambda a: (0, "") if a[1] == "print" else (5, ""), **fast)
     assert not ok and f"launchctl bootout {target}" in msg
-    ok, msg = service.uninstall(tmp_path, uid=501, run=lambda a: (113, "") if a[1] == "print" else (0, ""))
+    ok, msg = service.uninstall(tmp_path, uid=501, run=lambda a: (113, "") if a[1] == "print" else (0, ""), **fast)
     assert ok
     # R3: a failed inspection (timeout, missing launchctl, ...) is not proof the helper stopped
-    ok, msg = service.uninstall(tmp_path, uid=501, run=lambda a: (127, "") if a[1] == "print" else (0, ""))
+    ok, msg = service.uninstall(tmp_path, uid=501, run=lambda a: (127, "") if a[1] == "print" else (0, ""), **fast)
     assert not ok and "could not confirm" in msg and f"launchctl print {target}" in msg
+
+
+class StopClock:
+    """`launchctl print` exit codes in order (the last one repeats), on a fake clock that sleep() advances."""
+
+    def __init__(self, prints):
+        self.prints, self.now, self.calls, self.said = list(prints), 0.0, [], []
+
+    def run(self, argv):
+        self.calls.append(argv[1])
+        if argv[1] != "print":
+            return 0, ""
+        return (self.prints.pop(0) if len(self.prints) > 1 else self.prints[0]), ""
+
+    def sleep(self, s):
+        self.now += s
+
+    def uninstall(self, home):
+        (home / "Library" / "LaunchAgents").mkdir(parents=True, exist_ok=True)
+        service.plist_path(home).write_bytes(b"plist")
+        return service.uninstall(home, uid=501, run=self.run, clock=lambda: self.now, sleep=self.sleep,
+                                 say=self.said.append)
+
+
+def test_service_uninstall_waits_for_launchd_to_finish_the_bootout(tmp_path):
+    # 2026-11-09, real Mac: bootout returned, the job was still loaded for a few seconds, then gone (113)
+    c = StopClock([0, 0, 0, 0, 0, 0, 113])
+    ok, msg = c.uninstall(tmp_path)
+    assert ok, msg
+    assert c.calls[0] == "bootout" and c.calls.count("print") == 7
+    assert not service.plist_path(tmp_path).exists()
+    assert any("waiting for the background helper to stop" in s for s in c.said), c.said
+
+
+def test_service_uninstall_is_quiet_when_the_helper_stops_at_once(tmp_path):
+    c = StopClock([113])
+    ok, _ = c.uninstall(tmp_path)
+    assert ok and c.said == [] and c.now == 0
+
+
+def test_service_uninstall_gives_up_at_the_stop_deadline(tmp_path):
+    c = StopClock([0])
+    ok, msg = c.uninstall(tmp_path)
+    assert not ok and "still loaded" in msg and "launchctl bootout gui/501/dev.borrowed-hands.helper" in msg
+    assert service.STOP_WAIT_S <= c.now < service.STOP_WAIT_S + 1          # bounded, and it really waited
+    assert service.STOP_WAIT_S >= 120                                       # at least the LaunchAgent ExitTimeOut
+    # the job was never confirmed gone: keep its plist, so the install stays whole and a retry starts over
+    assert service.plist_path(tmp_path).exists()
+
+
+def test_service_uninstall_unknown_state_is_not_stopped(tmp_path):
+    c = StopClock([127])
+    ok, msg = c.uninstall(tmp_path)
+    assert not ok and "could not confirm" in msg
+    assert c.now >= service.STOP_WAIT_S and service.plist_path(tmp_path).exists()
+    c = StopClock([127, 0, 113])                                            # a transient failure, then gone
+    ok, msg = c.uninstall(tmp_path)
+    assert ok, msg
 
 
 # ------------------------------------------------------------------ bh uninstall: verified, with a checklist
@@ -367,7 +430,7 @@ def test_a_retry_cannot_inherit_success_while_caches_remain(tmp_path):
     text = w.text()
     assert rc == 1 and "Uninstalled and verified" not in text, text
     line = next(l for l in w.out if "caches" in l)
-    assert line.startswith("  LEFT ") and "sudo rm -rf '/private/var/folders/ab/xyz123'" in line, line
+    assert line.startswith("  LEFT ") and "remove it with: sudo rm -rf /private/var/folders/ab/xyz123" in line, line
 
 
 def test_uid_folders_scans_two_levels_and_fails_closed(tmp_path):
@@ -420,6 +483,166 @@ def test_cache_check_points_at_teardown_while_the_build_user_exists(tmp_path):
     bh(w, "uninstall")
     line = next(l for l in w.out if "caches" in l)
     assert line.startswith("  LEFT ") and "teardown-bh-builder.sh" in line and "rm -rf" not in line, line
+
+
+SKEL = "/private/var/folders/xq/k3v9w1m7p2d8hs4t6b0yzc5r0000fp"
+
+
+def test_the_macos_protected_skeleton_is_ok_with_a_note(tmp_path):
+    # 2026-11-09, real Mac: after teardown only sunlnk dirs (and a data vault) remain; root cannot remove them
+    w = uninstall_world(tmp_path)
+    w.caches, w.cache_left = [SKEL], []
+    rc = bh(w, "uninstall")
+    text = w.text()
+    line = next(l for l in w.out if "build user caches" in l)
+    assert line.startswith("  ok ") and "left by macOS" in line and SKEL in line and "nothing to do" in line, line
+    assert "rm -rf" not in line and "LEFT" not in text, text
+    assert rc == 0 and "Uninstalled and verified" in text, text
+
+
+def test_cache_advice_removes_only_what_is_not_protected(tmp_path):
+    w = uninstall_world(tmp_path)
+    w.caches, w.cache_left = [SKEL], [f"{SKEL}/X/leftover"]
+    rc = bh(w, "uninstall")
+    line = next(l for l in w.out if "build user caches" in l)
+    assert rc == 1 and line.startswith("  LEFT "), line
+    assert line.endswith(f"remove it with: sudo rm -rf {SKEL}/X/leftover"), line             # never the sunlnk dir
+
+
+def test_cache_contents_that_cannot_be_inspected_are_unknown(tmp_path):
+    w = uninstall_world(tmp_path)
+    w.caches, w.cache_left = [SKEL], "unknown"
+    rc = bh(w, "uninstall")
+    line = next(l for l in w.out if "build user caches" in l)
+    assert rc == 1 and line.startswith("  UNKNOWN ") and "rm -rf" not in line, line
+
+
+def test_the_protected_skeleton_still_points_at_teardown_while_the_build_user_exists(tmp_path):
+    # only the root teardown, with the account verified as ours, can look inside the 0700 folders
+    w = uninstall_world(tmp_path)
+    w.caches, w.cache_left = [SKEL], []
+    w.loaded.add("/Users/bh-builder")
+    rc = bh(w, "uninstall")
+    line = next(l for l in w.out if "build user caches" in l)
+    assert rc == 1 and line.startswith("  LEFT ") and "teardown-bh-builder.sh" in line, line
+
+
+# ---- security review: every copy-paste command in the checklist is shell-quoted, and none is printed for a path
+# holding control characters (names under T/ are chosen by build code running as uid 470)
+import shlex  # noqa: E402
+
+QUOTE, SUBST, NEWLINE = f"{SKEL}/T/it's", f"{SKEL}/T/$(touch pwned)", f"{SKEL}/T/x\nsudo rm -rf ~"
+
+
+def step_of(line):
+    return line.split("; remove it with: ", 1)[1]
+
+
+def test_cache_rm_advice_quotes_hostile_names(tmp_path):
+    w = uninstall_world(tmp_path)
+    w.caches, w.cache_left = [SKEL], [QUOTE, SUBST]
+    bh(w, "uninstall")
+    line = next(l for l in w.out if "build user caches" in l)
+    assert shlex.split(step_of(line)) == ["sudo", "rm", "-rf", QUOTE, SUBST], line
+
+
+@pytest.mark.parametrize("bad", [NEWLINE, f"{SKEL}/T/esc\x1b[2Jx", f"{SKEL}/T/bidi‮gnp.txt", f"{SKEL}/T/del\x7f"])
+def test_no_command_is_printed_for_a_path_with_control_characters(tmp_path, bad):
+    w = uninstall_world(tmp_path)
+    w.caches, w.cache_left = [SKEL], [QUOTE, bad]
+    rc = bh(w, "uninstall")
+    line = next(l for l in w.out if "build user caches" in l)
+    assert rc == 1 and line.startswith("  LEFT ") and "\n" not in line, line
+    assert "remove it with: no command shown" in line and "control characters" in line, line
+    assert "remove it with: sudo" not in line and "\r" not in line, line
+    assert bad not in line and not any(c in line for c in "\x1b‮\x7f"), line      # described, escaped
+
+
+def test_checklist_paths_from_the_home_option_are_quoted(tmp_path):
+    w = uninstall_world(tmp_path)
+    odd = tmp_path / "it's $(id)"
+    w.env = cli.replace(w.env, home=odd, user_home=odd)
+    w.left |= {str(odd), str(service.plist_path(odd))}
+    lines = {what: (state, step) for what, state, step in cli.uninstall_checklist(w.env)}
+    state, step = next(v for k, v in lines.items() if k.startswith("pairing"))
+    assert state == "LEFT" and shlex.split(step) == ["rm", "-rf", str(odd)], step
+    state, step = next(v for k, v in lines.items() if k.startswith("LaunchAgent"))
+    assert state == "LEFT" and shlex.split(step) == ["rm", str(service.plist_path(odd))], step
+    w.unknown_paths.add(str(odd))
+    lines = {what: (state, step) for what, state, step in cli.uninstall_checklist(w.env)}
+    state, step = next(v for k, v in lines.items() if k.startswith("pairing"))
+    assert state == "UNKNOWN" and shlex.split(step.split("check with: ", 1)[1]) == ["ls", "-ld", str(odd)], step
+
+
+def test_paste_command_quotes_or_refuses():
+    from borrowed_hands_helper.env import paste_command
+    argv = ["rm", "-rf", "a'b", "$(x)", "`y`", "c d;e"]
+    assert shlex.split(paste_command(argv)) == argv
+    assert shlex.split(paste_command(argv, sudo=True)) == ["sudo", *argv]
+    for bad in ("a\nb", "a\rb", "a\x00b", "a\x1bb", "a‮b", "a b", "a\x85b"):
+        assert paste_command(["rm", bad]) is None, repr(bad)
+
+
+def test_service_unlink_failure_advice_is_quoted(tmp_path):
+    home = tmp_path / "it's $(id)"
+    service.plist_path(home).mkdir(parents=True)                # a directory: unlink fails with an OSError
+    ok, msg = service.uninstall(home, uid=501, run=lambda a: (113, "") if a[1] == "print" else (0, ""))
+    assert not ok and shlex.split(msg.split("remove it with: ", 1)[1]) == ["rm", str(service.plist_path(home))], msg
+
+
+class FakeTree:
+    """lstat/listdir over {path: (mode, uid, flags) | errno}, for removable_entries."""
+
+    def __init__(self, tree, unlistable=()):
+        self.tree, self.unlistable, self.listed = tree, dict(unlistable), []
+
+    def lstat(self, p):
+        import stat as st
+        from types import SimpleNamespace
+        v = self.tree.get(p, errno.ENOENT)
+        if isinstance(v, int):
+            raise OSError(v, os.strerror(v), p)
+        mode, uid, flags = v
+        return SimpleNamespace(st_mode=mode | (st.S_IFDIR if mode == 0o755 else st.S_IFREG if mode == 0o644
+                                                else st.S_IFLNK), st_uid=uid, st_flags=flags)
+
+    def listdir(self, p):
+        self.listed.append(p)
+        if p in self.unlistable:
+            raise OSError(self.unlistable[p], os.strerror(self.unlistable[p]), p)
+        return sorted(c.rsplit("/", 1)[1] for c in self.tree if c.rsplit("/", 1)[0] == p)
+
+
+import errno  # noqa: E402
+
+D, F, L, NOUNLINK = 0o755, 0o644, 0o777, 0x00100000
+REAL = {SKEL: (D, 470, NOUNLINK), f"{SKEL}/0": (D, 470, NOUNLINK), f"{SKEL}/0/com.apple.LaunchServices.dv": errno.EPERM,
+        f"{SKEL}/T": (D, 470, NOUNLINK), f"{SKEL}/C": (D, 470, NOUNLINK), f"{SKEL}/X": (D, 470, NOUNLINK)}
+
+
+def removable(tree, unlistable=()):
+    from borrowed_hands_helper.env import removable_entries
+    t = FakeTree(tree, unlistable)
+    return removable_entries([SKEL], 470, lstat=t.lstat, listdir=t.listdir), t
+
+
+def test_removable_entries_accepts_only_the_protected_skeleton():
+    # T and C are 0700 to everyone but uid 470 and root: unreadable here, checked by the root teardown
+    unreadable = {f"{SKEL}/T": errno.EACCES, f"{SKEL}/C": errno.EACCES}
+    assert removable(REAL, unreadable)[0] == []
+    assert removable({**REAL, f"{SKEL}/X/f": (F, 470, 0)}, unreadable)[0] == [f"{SKEL}/X/f"]
+    assert removable({**REAL, f"{SKEL}/X/d": (D, 470, 0), f"{SKEL}/X/d/f": (F, 470, 0)})[0] == [f"{SKEL}/X/d"]
+    assert removable({**REAL, f"{SKEL}/X/u": (D, 501, NOUNLINK)})[0] == [f"{SKEL}/X/u"]       # not uid 470's
+    assert removable({**REAL, SKEL: (D, 470, 0)})[0] == [SKEL]                                # the root has no flag
+    assert removable({**REAL, f"{SKEL}/X/uchg": (D, 470, 0x2)})[0] == [f"{SKEL}/X/uchg"]     # a user flag only
+
+
+def test_removable_entries_never_follows_a_symlink_and_fails_closed():
+    res, t = removable({**REAL, f"{SKEL}/X/link": (L, 470, NOUNLINK)})
+    assert res == [f"{SKEL}/X/link"] and f"{SKEL}/X/link" not in t.listed
+    assert removable({**REAL, SKEL: errno.EPERM})[0] is None                  # a data vault only inside a folder
+    assert removable({**REAL, f"{SKEL}/X/io": errno.EIO})[0] is None
+    assert removable(REAL, {f"{SKEL}/X": errno.EIO})[0] is None              # only "not readable by me" is skipped
 
 
 def test_uninstall_failed_inspections_are_unknown_not_ok(tmp_path):

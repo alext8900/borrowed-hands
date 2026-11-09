@@ -28,6 +28,56 @@ user_is_ours() {
   attr_is /Users/$U UserShell /usr/bin/false
 }
 
+# macOS keeps a per-user folder skeleton under /private/var/folders that root cannot remove: directories with the
+# system no-unlink flag (sunlnk, SF_NOUNLINK, enforced by SIP), and SIP data vaults such as
+# 0/com.apple.LaunchServices.dv that the kernel will not even let root stat. Nothing here clears system flags.
+SF_NOUNLINK=1048576     # 0x00100000, <sys/stat.h>
+# entry_kind <path>: lstat only (a symlink reports itself, never its target). 0 a directory owned by uid 470 with
+# SF_NOUNLINK; 3 the kernel refuses even root a stat (a data vault); 1 anything else; 2 could not be inspected.
+entry_kind() {
+  local out flags
+  if out=$(LC_ALL=C stat -f '%HT:%u:%f' "$1" 2>&1); then
+    flags=${out##*:}
+    [[ $flags =~ ^(0|[1-9][0-9]{0,9})$ ]] || return 2
+    [ "${out%:*}" = "Directory:$ID" ] && (( flags & SF_NOUNLINK )) && return 0
+    return 1
+  fi
+  case $out in *": Operation not permitted") return 3 ;; esac
+  return 2
+}
+# protected_tree <dir>: 0 if everything left in <dir> (already a protected folder) is itself the protected skeleton,
+# recursively; 1 if anything removable or uninspectable is left. A listing that fails is never "empty"; ls -A
+# lists names without stat-ing them, and -b escapes odd bytes so a crafted name cannot pose as two entries.
+protected_tree() {
+  local names e
+  names=$(LC_ALL=C ls -1Ab "$1") || { echo "could not list $1" >&2; return 1; }
+  while IFS= read -r e; do
+    [ -n "$e" ] || continue
+    entry_kind "$1/$e"
+    case $? in
+      0) protected_tree "$1/$e" || return 1 ;;
+      3) ;;                 # a data vault inside a protected folder: nobody can read or remove it
+      *) echo "left behind (not a macOS-protected folder): $1/$e" >&2; return 1 ;;
+    esac
+  done <<<"$names"
+}
+# caches_cleared: after the removal, 0 if nothing of uid 470's is left under /private/var/folders but the protected
+# skeleton (reported, one line per folder); 1 if anything else is left or the check itself fails.
+caches_cleared() {
+  local roots root kept=()
+  roots=$(find /private/var/folders -maxdepth 2 -user $ID -prune 2>/dev/null) || return 1
+  while IFS= read -r root; do
+    [ -n "$root" ] || continue
+    entry_kind "$root" || { echo "left behind (not a macOS-protected folder): $root" >&2; return 1; }
+    protected_tree "$root" || return 1
+    kept+=("$root")
+  done <<<"$roots"
+  for root in ${kept[@]+"${kept[@]}"}; do
+    echo "left by macOS (protected per-user folders, nothing removable left): $root; macOS removes or reuses" \
+      "these; nothing to do"
+  done
+}
+
 main() {
   [ "$(id -u)" = 0 ] || { echo "run with sudo" >&2; exit 1; }
   cd /
@@ -59,8 +109,10 @@ main() {
       fi
       # Files uid 470 owns elsewhere (per-user temp/cache dirs under /var/folders), while uid 470 is still
       # verifiably our account: once the account is gone nothing can authorize this again, so on failure keep the
-      # account and the dispatcher and stop, and a rerun verifies, sweeps and retries.
-      if ! find /private/var/folders -maxdepth 2 -user $ID -prune -exec rm -rf {} + 2>/dev/null; then
+      # account and the dispatcher and stop, and a rerun verifies, sweeps and retries. rm -rf removes all it can and
+      # fails on macOS's protected skeleton, so judge what is left, not rm's exit code.
+      find /private/var/folders -maxdepth 2 -user $ID -prune -exec rm -rf {} + 2>/dev/null
+      if ! caches_cleared; then
         echo "could not remove uid $ID's caches under /private/var/folders; kept user $U and $PREFIX so" \
           "'bh uninstall' (or this script) can retry" >&2
         exit 1

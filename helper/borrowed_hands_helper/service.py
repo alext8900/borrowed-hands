@@ -5,13 +5,19 @@ from __future__ import annotations
 import os
 import plistlib
 import sys
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from . import caps as capsmod
 
 LABEL = "dev.borrowed-hands.helper"
 LAUNCHCTL = "/bin/launchctl"
+# How long uninstall waits for launchd to finish a bootout. launchd SIGTERMs the helper, which drains or cancels a
+# running build (its own stop deadline is 90 s), and SIGKILLs it at ExitTimeOut (120 s, below); so the job is gone
+# by then plus launchd's own teardown. Same bound as the CLI's helper-lock fence (Env.stop_wait_s).
+STOP_WAIT_S = 130.0
+STOP_POLL_S = 0.25
 
 
 def plist_path(user_home: Path) -> Path:
@@ -70,23 +76,40 @@ def install(user_home: Path = Path.home(), uid: Optional[int] = None, run: capsm
 
 
 def uninstall(user_home: Path = Path.home(), uid: Optional[int] = None,
-              run: capsmod.Run = capsmod.run_cmd) -> tuple[bool, str]:
+              run: capsmod.Run = capsmod.run_cmd, clock: Callable[[], float] = time.monotonic,
+              sleep: Callable[[float], None] = time.sleep,
+              say: Optional[Callable[[str], None]] = None) -> tuple[bool, str]:
     uid = os.getuid() if uid is None else uid
     target = f"gui/{uid}/{LABEL}"
     run([LAUNCHCTL, "bootout", target])
+    # bootout's own exit code cannot tell "not loaded" from "failed", and it can return while launchd is still
+    # stopping the job (seen on a real Mac): poll until the job is verifiably gone, up to the stop bound.
+    start = clock()
+    waiting = False
+    while True:
+        state = loaded(uid, run)
+        if state is False or clock() - start >= STOP_WAIT_S:
+            break
+        if not waiting and clock() - start >= 1.0 and say is not None:
+            say(f"  waiting for the background helper to stop (up to {int(STOP_WAIT_S)} s) ...")
+            waiting = True
+        sleep(STOP_POLL_S)
+    if state is None:
+        return False, (f"could not confirm the background helper stopped; check with: launchctl print {target} "
+                       f"(exit 113 means it is gone), or stop it with: launchctl bootout {target}")
+    if state:
+        return False, f"the background helper is still loaded; stop it with: launchctl bootout {target}"
+    # Only now that the job is gone: until then the plist stays, so a failed stop leaves the install whole (a login
+    # restarts the same helper) and a retry boots it out by label again.
     p = plist_path(user_home)
     try:
         os.unlink(p)
     except FileNotFoundError:
         pass
     except OSError as e:
-        return False, f"could not delete {p} ({e.strerror}); remove it with: rm '{p}'"
-    state = loaded(uid, run)                 # bootout's own exit code cannot tell "not loaded" from "failed"
-    if state is None:
-        return False, (f"could not confirm the background helper stopped; check with: launchctl print {target} "
-                       f"(exit 113 means it is gone), or stop it with: launchctl bootout {target}")
-    if state:
-        return False, f"the background helper is still loaded; stop it with: launchctl bootout {target}"
+        from .env import describe_unsafe, paste_command
+        return False, (f"could not delete {p} ({e.strerror}); remove it with: "
+                       f"{paste_command(['rm', str(p)]) or describe_unsafe(['rm', str(p)])}")
     return True, "the background helper is stopped and removed"
 
 
