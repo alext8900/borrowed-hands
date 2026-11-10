@@ -168,6 +168,36 @@ def test_grant_add_list_revoke(tmp_path):
     assert bh(w, "grant", "revoke", "demo") == 2
 
 
+@pytest.mark.parametrize("typed,stored", [("debug", "Debug"), ("DEBUG", "Debug"), ("release", "Release"),
+                                          ("Release", "Release"), ("Staging", "Staging"), ("debug-fast", "debug-fast")])
+def test_grant_add_stores_xcodes_own_spelling_of_debug_and_release(tmp_path, typed, stored):
+    """A fresh install on 2026-11-10 granted `debug`; grants are compared exactly, so a later request for `Debug`
+    would have been refused. Only the two names every Xcode project starts with are respelled."""
+    w = World(tmp_path)
+    paired(w)
+    assert bh(w, "grant", "add", "xcode.build", "--workspace", "demo", "--repo", H.REMOTE, "--project",
+              "Demo.xcodeproj", "--scheme", "Demo", "--configuration", typed) == 0, w.text()
+    assert config.load(w.env.home).workspace("demo").configurations == (stored,)
+
+
+def test_setup_stores_xcodes_own_spelling_of_debug_and_release(tmp_path):
+    from borrowed_hands_helper import setup
+    w = World(tmp_path, answers=["demo", H.REMOTE, "Demo.xcodeproj", "Demo", "debug, RELEASE , Staging", "1", "n"])
+    ws = setup.ask_workspace(w.env)
+    assert ws.configurations == ("Debug", "Release", "Staging")
+
+
+def test_the_prompt_reader_loads_line_editing(monkeypatch):
+    """Without readline, the arrow keys print escape codes into the answer instead of moving the cursor."""
+    import builtins
+    import sys
+    from borrowed_hands_helper import env
+    monkeypatch.setattr(builtins, "input", lambda prompt="": "x")
+    sys.modules.pop("readline", None)
+    assert env._ask("? ") == "x"
+    assert "readline" in sys.modules
+
+
 @pytest.mark.parametrize("args,needle", [
     (["--repo", "http://github.com/a/b"], "https"),
     (["--repo", "https://tok@github.com/a/b"], "https"),

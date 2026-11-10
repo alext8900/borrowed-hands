@@ -177,6 +177,13 @@ def _name_list(values, what: str, max_items: int) -> tuple[str, ...]:
     return tuple(dict.fromkeys(out))
 
 
+def xcode_configuration(name: str) -> str:
+    """`debug` and `release` in Xcode's own spelling. Grants are compared exactly, and those two names are what
+    every Xcode project starts with, so a grant typed in lowercase would refuse a later request for `Debug`. Any
+    other name is kept as typed."""
+    return {"debug": "Debug", "release": "Release"}.get(name.casefold(), name)
+
+
 def validate_workspace(ws: Workspace) -> Workspace:
     if not isinstance(ws.id, str) or not WORKSPACE_ID_RE.match(ws.id):
         raise ConfigError(f"workspace id {ws.id!r} must be lowercase letters, digits, _ or - (max 64)")

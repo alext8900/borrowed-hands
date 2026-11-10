@@ -25,6 +25,10 @@ def _err(text: str) -> None:
 
 def _ask(prompt: str) -> str:
     try:
+        import readline  # noqa: F401  input() then edits the line; without it the arrow keys type escape codes
+    except ImportError:
+        pass
+    try:
         return input(prompt)
     except EOFError:
         return ""

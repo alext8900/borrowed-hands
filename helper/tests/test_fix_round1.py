@@ -502,7 +502,7 @@ def test_service_program_from_a_real_uv_tool_install(tmp_path):
     assert argv[0].startswith(str(tmp_path / "tools")), argv
     out = subprocess.run(argv[:-1] + ["--version"], capture_output=True, text=True, timeout=60,
                          env={"PATH": "/usr/bin:/bin"})
-    assert out.returncode == 0 and out.stdout.strip() == "bh 0.2.0", out.stderr
+    assert out.returncode == 0 and out.stdout.strip() == "bh 0.2.1", out.stderr
 
 
 # ------------------------------------------------------------------ LOW 7

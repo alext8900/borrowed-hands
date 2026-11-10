@@ -160,8 +160,9 @@ def ask_workspace(env: Env) -> Workspace:
         repo = env.ask("  Public https URL of its git repo: ").strip()
         project = env.ask("  Project inside the repo (e.g. App.xcodeproj or App.xcworkspace): ").strip()
         schemes = [s.strip() for s in env.ask("  Scheme(s) Hermes may build, comma-separated: ").split(",") if s.strip()]
-        configs = [s.strip() for s in env.ask("  Configuration(s) [Debug]: ").split(",") if s.strip()] or ["Debug"]
-        d = env.ask("  Destination: 1) macOS on Apple silicon  2) iOS Simulator (compile only)  3) both [1]: ").strip()
+        typed = env.ask("  Configuration(s), comma-separated (press Return for Debug): ")
+        configs = [config.xcode_configuration(s.strip()) for s in typed.split(",") if s.strip()] or ["Debug"]
+        d = env.ask("  Destination: 1) macOS on Apple silicon  2) iOS Simulator (compile only)  3) both (press Return for 1): ").strip()
         dests = {"": [DESTINATIONS[0]], "1": [DESTINATIONS[0]], "2": [DESTINATIONS[1]],
                  "3": list(DESTINATIONS)}.get(d, [d])
         confirm = _yes(env, "  Ask on this Mac before every build?", False)

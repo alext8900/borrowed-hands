@@ -393,7 +393,7 @@ def pre_tool_call(tool_name=None, args=None, session_id="", tool_call_id="", **_
 
 `ctx.state` (`hermes_cli/plugins_state.py:134-195`) is a whole-file JSON key/value store: every `set` rewrites the
 file under a lock, the quota is 10 MiB, and there is no delete. That fits neither the job table nor the replay table.
-So we use **only its `data_dir`** (`$HERMES_HOME/plugin-data/<namespace>/`) and keep our own files there:
+So the plugin uses **only its `data_dir`** (`$HERMES_HOME/plugin-data/<namespace>/`) and keeps its own files there:
 
 | File | Content | Mode |
 |---|---|---|
@@ -701,7 +701,7 @@ still require device acceptance; server health alone does not establish them.
 
 ## 12. Catalog compliance
 
-| Rule | How we comply |
+| Rule | How the plugin complies |
 |---|---|
 | 2, 4 | The catalog entry pins the SHA; `subdir: borrowed-hands`. |
 | 3 | No self-update: the helper never fetches code; `uv tool install` at a SHA is user-run. |
@@ -709,7 +709,7 @@ still require device acceptance; server health alone does not establish them.
 | 7 | Run `hermes plugins validate borrowed-hands --install-deps` in CI from day 1. The sudoers, dscl and sandbox sources live outside `borrowed-hands/`, so the scanner's `sudo`/ssh patterns do not fire on the plugin tree, but they are in the same repo, linked from the README and disclosed. |
 | 9 | Public `ctx.*` only. No core module is imported or patched; `gateway.run` is only checked for membership in `sys.modules`, and the build handler reads (never sets) the dispatch `tool_call_id` context variable of the already-loaded `tools.approval_context`, through `sys.modules`. |
 | 10 | Bounded ranges in `python_dependencies`. |
-| 11 | No secrets read. Our own generated keys live in the plugin data dir; disclosed. |
+| 11 | No secrets read. Its own generated keys live in the plugin data dir; disclosed. |
 | 12 | `approve` on mutating tools, fail closed; never auto-approve; the per-workspace device confirm times out at 120 s instead of hanging; no spawned Hermes or shell children. |
 | 13 | Disclosure lines below go in the README and the PR. |
 | 14 | `requires_hermes: ">=0.22.7"` in both plugin.yaml and the entry. |

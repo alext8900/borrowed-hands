@@ -119,7 +119,7 @@ Xcode installed at `/Applications/Xcode.app` and opened once. Builds always use 
    inside the package:
 
    ```sh
-   uv tool install "git+https://github.com/alext8900/borrowed-hands@v0.2.0#subdirectory=helper"
+   uv tool install "git+https://github.com/alext8900/borrowed-hands@v0.2.1#subdirectory=helper"
    uv tool update-shell
    ```
 
@@ -314,10 +314,10 @@ What Allow grants: the permission (`kTCCServiceSystemPolicySysAdminFiles`) goes 
 prompt, not to Borrowed Hands, so anything else that runs in that app can use it too. On macOS 27.2 the log showed
 a request made 26 ms after an Allow granted without a new prompt, and new prompts 20 and 59 minutes later, so how
 long it lasts is not established. The permission is not listed under System Settings > Privacy & Security on
-macOS 27.2 (we checked the list of services that pane shows, not every other pane), and how to revoke it was not
+macOS 27.2 (I checked the list of services that pane shows, not every other pane), and how to revoke it was not
 established either.
 
-What we know: on macOS 27.2, `dscl . -delete /Users/bh-builder` hung until opendirectoryd timed it out after about
+What I know: on macOS 27.2, `dscl . -delete /Users/bh-builder` hung until opendirectoryd timed it out after about
 five minutes ("ODRecordDelete ... forcing a timeout") and `dscl` failed with DS Error -14987 (eUndefinedError). The
 unified log at the second of the delete shows tccd prompting for that permission on behalf of the terminal's app,
 and the prompt taking focus. Runs where it was answered finished in under a minute: on the same Mac a full
@@ -333,7 +333,7 @@ made, about 12 minutes after the `bh uninstall` that made it had exited saying i
 637 seconds after it was made, when the run that made it had already ended in an error. A second request made while
 a prompt is open does not show a second prompt; it waits behind the first.
 
-So, only after it has verified the account is ours, the teardown stops uid 470's processes, then deletes the
+So, only after it has verified the account is the one Borrowed Hands created, the teardown stops uid 470's processes, then deletes the
 account with a limit just under five minutes, which leaves time to notice and answer the prompt. If that fails it
 first checks whether the account is gone anyway (an answered prompt can finish the delete after `dscl` stopped;
 only a listing that works and no longer shows `bh-builder` counts), and otherwise retries once. If the retry also
@@ -450,7 +450,7 @@ line by hand.
 | `Setup stopped at [n/7] ...` | fix the error shown and run `bh setup` again; it skips finished steps |
 | a build says `sudo asked for a password for the Borrowed Hands build command ...` | another sudo rule makes the build command need a password. `bh selftest` cannot see this (it checks that sudo permits the commands, not that they are password-free). Remove or reorder that rule, then run `bh selftest` |
 | selftest `FAIL sudo rule: installed` | run `bh setup` again; it compares the installed rule with the exact one and replaces it if it differs |
-| setup or selftest says another sudo rule overrides ours (`FAIL sudo rule: permitted`) | a later rule in `/etc/sudoers` or `/etc/sudoers.d` matches `/opt/borrowed-hands/bin/bh-dispatch`; change that rule (Borrowed Hands never edits other sudo rules) |
+| setup or selftest says another sudo rule overrides the Borrowed Hands rule (`FAIL sudo rule: permitted`) | a later rule in `/etc/sudoers` or `/etc/sudoers.d` matches `/opt/borrowed-hands/bin/bh-dispatch`; change that rule (Borrowed Hands never edits other sudo rules) |
 | a build fails with `not_on_bh_branch` | push the commit to a `bh/` branch |
 | a build fails with `unsupported_dependencies` | vendor remote Swift packages as local path packages |
 | to re-pair a Mac | `bh unpair`, then `bh setup`, then re-add grants (pairing again resets them) |

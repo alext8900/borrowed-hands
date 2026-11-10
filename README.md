@@ -35,7 +35,7 @@ TLS reverse proxy or a tunnel in front of its listener. Check `https://<your dom
 `uv tool install ./helper` does the same):
 
 ```sh
-uv tool install "git+https://github.com/alext8900/borrowed-hands@v0.2.0#subdirectory=helper"
+uv tool install "git+https://github.com/alext8900/borrowed-hands@v0.2.1#subdirectory=helper"
 uv tool update-shell     # then open a new terminal window
 bh setup
 ```
@@ -137,7 +137,7 @@ for both sides, with paths, is in [docs/QUICKSTART.md](docs/QUICKSTART.md#uninst
 - **App Store Connect releases:** signed archives and TestFlight or App Store uploads under the owner's approval.
 - **Windows build hosts**, with the same pairing and grant model.
 
-## How we tested it
+## How I tested it
 
 - **Run the tests yourself.** Helper unit tests: `cd helper && uv run --frozen pytest -q`. Plugin and protocol tests
   against a Hermes v0.22.7 checkout that has a `.venv`: `HERMES_SRC=<checkout> bash tests/run-plugin-tests.sh`. The

@@ -149,7 +149,7 @@ nothing.
 
 ## Mac helper reference
 
-Install with `uv tool install "git+https://github.com/alext8900/borrowed-hands@v0.2.0#subdirectory=helper"`
+Install with `uv tool install "git+https://github.com/alext8900/borrowed-hands@v0.2.1#subdirectory=helper"`
 (or `uv tool install ./helper` from a checkout of this repository), then `uv tool update-shell` and open a
 new terminal. The helper needs the whole checkout: its package includes the protocol schemas and the sandbox
 scripts. `bh setup` then runs these steps, skipping any that are already done:
@@ -160,7 +160,7 @@ scripts. `bh setup` then runs these steps, skipping any that are already done:
    its bytes with the exact rule (`sudo /usr/bin/cmp -s ...`, printed first) and keeps it only if they match;
    otherwise it stages the rule, checks it with `visudo -cf` and moves it into place. Then it asks sudo itself
    (`sudo -n -l -- <command>`) whether each of the six exact commands is permitted. If one is not, another rule
-   on this Mac overrides ours; setup names the command and stops without editing other sudo rules.
+   on this Mac overrides the Borrowed Hands rule; setup names the command and stops without editing other sudo rules.
    Permitted is not the same as password-free: a later rule that only adds a password requirement (for example
    `PASSWD:` on `/opt/borrowed-hands/bin/` or on one of the commands) still passes this check and `bh selftest`.
    It shows when a build runs: the build fails with reason `dispatch_error` and the message below. Setup cannot
@@ -239,4 +239,4 @@ and refuses if they are not verifiably empty), then
 `/hands unpair` each Mac, then delete the Railway service and volume, or stop the gateway and remove the plugin and
 only its own data directory.
 
-How this was tested: see [How we tested it](../README.md#how-we-tested-it).
+How this was tested: see [How I tested it](../README.md#how-i-tested-it).

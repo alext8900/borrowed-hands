@@ -62,7 +62,7 @@ deliberately breaks the HIGH 1 and MEDIUM 4 fixes; all 8 mutants were killed.
 | HIGH a | **The root dispatcher enforces budgets**, not only the runner, which runs as the same uid as the build. Every 1 s bh-dispatch checks: `os.statvfs` of the jobs volume (free-space drop since job start against the disk budget, plus an absolute 10 GB free floor); summed RSS of uid 470 against the memory budget (`ps` as root); and the wall-clock deadline (runner timeout + 30 s). On a breach it boots the job out and sweeps; the status is `disk_budget` / `memory_budget` / `timeout`. statvfs sees unlinked-but-open files that a directory walk can't. | `run-tests.sh budget`: an unlinked, still-open 3 GB file against a 1000 MB budget gives `disk_budget` "dispatcher (statvfs): volume free space fell by ..."; the volume stays writable and no processes are left. Mutant: dispatcher without the statvfs check. |
 | HIGH b | **The runner's budget checks fail closed.** `du` is replaced by an `os.walk`/`lstat` sum. Files that vanish mid-walk are skipped. EPERM is skipped too: macOS-protected Apple dirs such as `T/com.apple.trustd/TemporaryItems` return it, and the dispatcher's statvfs still counts their bytes. Anything else (EACCES, more than 3M entries) raises. `ps` non-zero or unparsable raises. Any failure gives status `budget_check_failed`. | unit: disk measurement raising, ps rc=1 and unparsable ps output each give `budget_check_failed`. Mutant: runner budget checks failing open. |
 | HIGH c | **builder.sb `(deny signal) (allow signal (target same-sandbox))`** (syntax verified on macOS 27.2). The build can signal only processes inside its sandbox, not the runner, its `ps`, or launchd's agents. The runner writes its pid to `<job>/tmp/.bh-runner-pid` on purpose, so the test isn't vacuous. | `tests/hog-app` "stopper": a Run Script reads the runner pid, then tries `kill -STOP`, `pkill -STOP -f`, `kill -KILL`; all three are DENIED, and the unlinked-file hog that follows is still stopped by the dispatcher (`disk_budget`). Positive control: under allow-all.sb the same script stops and kills the runner, and the dispatcher still ends the job and sweeps. Probe `signal_runner` uses the same pid. Mutant: builder.sb without `(deny signal)`. |
-| MEDIUM | **setup claims the home exclusively** (`claim_dir`). An existing path is adopted only if it is a real dir owned by 470 with mode 0700, and only if empty unless the user already existed (our own earlier install). Otherwise setup runs a plain `mkdir -m 700` (no `-p` on the final component), `chown -h`, and re-checks. Symlinks are refused. `setup --check-home <path>` runs just this logic, for tests. | Scratch paths under /Users/Shared: a dir owned by 501 with a file, an empty dir owned by 501, and a symlink are each refused (and left untouched); a missing path is created as 470:700. Mutant: setup adopting a home it doesn't own. |
+| MEDIUM | **setup claims the home exclusively** (`claim_dir`). An existing path is adopted only if it is a real dir owned by 470 with mode 0700, and only if empty unless the user already existed (an earlier Borrowed Hands install). Otherwise setup runs a plain `mkdir -m 700` (no `-p` on the final component), `chown -h`, and re-checks. Symlinks are refused. `setup --check-home <path>` runs just this logic, for tests. | Scratch paths under /Users/Shared: a dir owned by 501 with a file, an empty dir owned by 501, and a symlink are each refused (and left untouched); a missing path is created as 470:700. Mutant: setup adopting a home it doesn't own. |
 | MEDIUM | **DNS pin.** The runner resolves the remote once (all addresses must be public), then runs git with `-c http.curloptResolve=<host>:443:<addr>` (git 2.54.0 supports it). Rebinding between validation and fetch no longer changes where git connects. | unit: git argv contains `http.curloptResolve=github.com:443:140.82.112.3` from a patched resolver. Live: git pinned to 192.0.2.1 gets no answer from github.com; the real https fetch under git.sb still works through the pin. Mutant: runner without the pin. |
 | LOW | 6to4 `2002::/16`, Teredo `2001::/32` and NAT64 `64:ff9b::/96`, `64:ff9b:1::/48` are rejected outright. IPv4-mapped addresses are unwrapped and checked. | unit (python3 3.9): 2002:7f00:1::1, 2001:0:4136:e378::1, 64:ff9b::7f00:1, ::ffff:10.0.0.1, 100.64.1.1 and fd12::1 rejected; public v4+v6 accepted. |
 | LOW | **runner.err** is created by root with `openat(job_dir_fd, O_CREAT|O_EXCL|O_NOFOLLOW)`, then `fchown` 470, `fchmod` 0600 and `fstat`-verified on the fd (regular, uid 470, nlink 1, 0600). Only then does its path go into the plist. | Every dispatch path (all build tests). |
@@ -306,7 +306,7 @@ Real example (compile error test):
   `setgid(470)` and `setuid(470)`, then calls the same function. The kernel therefore can't let it signal
   anything but uid 470.
 - **teardown-bh-builder.sh:** first sweeps with `bh-dispatch --sweep-only` (as uid 470, above). Then, after
-  verifying that uid 470 belongs to our `bh-builder` and to no other account, and right before deleting that
+  verifying that uid 470 belongs to this install's `bh-builder` and to no other account, and right before deleting that
   account, root boots out the `user/470` (and `gui/470`) launchd domains and runs `pkill -KILL -U 470` until
   `pgrep -U 470` finds nothing, so no build process outlives its account. Root does the same when the account is
   already gone (for example after a late Allow), but only when no other local account holds uid 470 and
@@ -757,14 +757,15 @@ Other known limits of the teardown, documented rather than fixed:
 
 - When the account is already gone, it boots out and kills uid 470 by uid with only the local directory vouching
   that uid 470 is free: no other local account may hold it and `dscl . -read /Users/bh-builder` must answer "not
-  found". An account from a network directory on uid 470 would not be seen. It does this even when nothing of
-  ours is left (no group, home or dispatcher). uid 470 is in the hidden system range, so this needs an unusual Mac.
+  found". An account from a network directory on uid 470 would not be seen. It does this even when nothing
+  Borrowed Hands installed is left (no group, home or dispatcher). uid 470 is in the hidden system range, so this
+  needs an unusual Mac.
 - If root's search of `/private/var/folders` fails in that branch while the checklist's own scan sees no uid-470
   folder, the teardown exits 3 and `bh uninstall` can still end with "Uninstalled and verified", next to a
   teardown line saying the folders could not be verified. No realistic way to get there is known.
 - With Full Disk Access on the terminal, that branch can list the empty `TemporaryItems` folders macOS leaves,
   and the read-only check rejects a listable folder: exit 3, the caches line `UNKNOWN`. That Full Disk Access makes
-  them listable is inferred from our research, not observed. Turning Full Disk Access off for the terminal and
+  them listable is inferred from my research, not observed. Turning Full Disk Access off for the terminal and
   rerunning `bh uninstall` should take the size proof instead (also not observed).
 
 Run these only on a Mac you are prepared to modify: setup creates a hidden user and installs root-owned files.

@@ -129,7 +129,8 @@ def cmd_grant(env: Env, a) -> int:
         try:
             expires = config.parse_expires(a.expires, _now_ms()) if a.expires is not None else None
             ws = Workspace(id=a.workspace, remote_url=a.repo, project=a.project, schemes=tuple(a.scheme),
-                           configurations=tuple(a.configuration or ["Debug"]),
+                           configurations=tuple(config.xcode_configuration(c)
+                                                for c in (a.configuration or ["Debug"])),
                            destinations=tuple(a.destination or [config.DESTINATIONS[0]]), confirm=a.confirm,
                            expires_at=expires)
             new_cfg = config.update(env.home, add)       # load, check and write as one locked transaction
