@@ -138,7 +138,7 @@ def test_config_reload_during_cleanup_preserves_only_authorized_builds(tmp_path,
             if change == "disable":
                 cfg = cfg.with_capability("xcode.build", False)
             elif change == "revoke":
-                cfg = cfg.with_workspace(dataclasses.replace(cfg.workspace("demo"), schemes=("Other",)))
+                cfg = cfg.with_workspace(dataclasses.replace(cfg.workspace("demo"), schemes=("Other",)), replace_existing=True)
             config.save(home, cfg)
             # The watcher's caps update follows its cancellation checks, so no polling delay can mask them.
             await until(lambda: d._last_caps is not None and d._last_caps.get("name") == "Renamed Mac")

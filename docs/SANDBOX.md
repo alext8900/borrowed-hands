@@ -305,11 +305,14 @@ Real example (compile error test):
 - **bh-dispatch:** runs as root, but its sweeps run in a forked child that first calls `setgroups([])`,
   `setgid(470)` and `setuid(470)`, then calls the same function. The kernel therefore can't let it signal
   anything but uid 470.
-- **teardown-bh-builder.sh:** first sweeps with `bh-dispatch --sweep-only` (as uid 470, above). Then, only after
+- **teardown-bh-builder.sh:** first sweeps with `bh-dispatch --sweep-only` (as uid 470, above). Then, after
   verifying that uid 470 belongs to our `bh-builder` and to no other account, and right before deleting that
   account, root boots out the `user/470` (and `gui/470`) launchd domains and runs `pkill -KILL -U 470` until
-  `pgrep -U 470` finds nothing. A per-user `distnoted` otherwise stalled the delete on a real Mac (see
-  QUICKSTART, Uninstall).
+  `pgrep -U 470` finds nothing, so no build process outlives its account. Root does the same when the account is
+  already gone (for example after a late Allow), but only when no other local account holds uid 470 and
+  `dscl . -read /Users/bh-builder` answers "not found". (The delete itself can wait on macOS's
+  "administer your computer" prompt for the terminal's app; that, not a leftover process, is what made it hang on a
+  real Mac. See QUICKSTART, Uninstall.)
 - **Tests:** `run-tests.sh` keeps a uid-501 sentinel process alive across the guard, timeout, cancel and
   probe-suite steps, and asserts it survives each one (it does). It also runs the kill function as uid 501
   and asserts that it is a no-op.
@@ -667,7 +670,7 @@ project needs a service, add exactly that `global-name`, with the violation log 
    `job.json`, `result.json` and `runner.err` stay until the caller deletes the job dir. Builds can't
    read other job dirs (row `read_other_job_marker`). Apple's per-user agents (distnoted, cfprefsd, ...) may
    be respawned by launchd between jobs; they're Apple binaries, and every sweep kills them.
-6. **Swift packages: closed for 0.1.** Remote package dependencies are detected before the build and
+6. **Swift packages: closed for 0.2.** Remote package dependencies are detected before the build and
    refused with `unsupported_dependencies` and the files to fix; vendored local-path packages build.
    Still true: no network during builds (`-disableAutomaticPackageResolution`); the iOS Simulator
    destination is compile-only. SDK macros (`@State`, `#Preview`, `@Observable`) build since
@@ -743,6 +746,26 @@ bash tests/mutation-check.sh                                   # HIGH 1 / MEDIUM
 sudo bash sandbox/setup-bh-builder.sh                          # production install: no test profiles, no TEST_MODE
 sudo bash sandbox/teardown-bh-builder.sh                       # remove everything
 ```
+
+Running the teardown by hand is only for a stopped install. `bh uninstall` stops the helper and removes the sudo
+rule before it runs the teardown; the bare script does neither, so with a live, paired helper a build could be
+dispatched while it waits for the delete (up to about ten minutes), and on Allow it would then walk the home as
+root under that build. Over SSH, or on a Mac with nobody at the screen, who sees the "administer your computer"
+prompt and what it calls the app was not observed.
+
+Other known limits of the teardown, documented rather than fixed:
+
+- When the account is already gone, it boots out and kills uid 470 by uid with only the local directory vouching
+  that uid 470 is free: no other local account may hold it and `dscl . -read /Users/bh-builder` must answer "not
+  found". An account from a network directory on uid 470 would not be seen. It does this even when nothing of
+  ours is left (no group, home or dispatcher). uid 470 is in the hidden system range, so this needs an unusual Mac.
+- If root's search of `/private/var/folders` fails in that branch while the checklist's own scan sees no uid-470
+  folder, the teardown exits 3 and `bh uninstall` can still end with "Uninstalled and verified", next to a
+  teardown line saying the folders could not be verified. No realistic way to get there is known.
+- With Full Disk Access on the terminal, that branch can list the empty `TemporaryItems` folders macOS leaves,
+  and the read-only check rejects a listable folder: exit 3, the caches line `UNKNOWN`. That Full Disk Access makes
+  them listable is inferred from our research, not observed. Turning Full Disk Access off for the terminal and
+  rerunning `bh uninstall` should take the size proof instead (also not observed).
 
 Run these only on a Mac you are prepared to modify: setup creates a hidden user and installs root-owned files.
 

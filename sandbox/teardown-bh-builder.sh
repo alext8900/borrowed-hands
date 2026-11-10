@@ -1,6 +1,7 @@
 #!/bin/bash
 # Borrowed Hands: remove the build user, its home, and /opt/borrowed-hands.
-#   sudo bash sandbox/teardown-bh-builder.sh
+#   sudo bash sandbox/teardown-bh-builder.sh   (use 'bh uninstall', which stops the helper and removes the sudo
+#   rule first; run this by hand only for a stopped install, see docs/SANDBOX.md)
 # Touches only our own label (system/com.borrowedhands.runner), /opt/borrowed-hands, and the bh-builder user,
 # group, home and per-user caches AFTER checking they are ours: the identity setup-bh-builder.sh creates (user
 # bh-builder with exactly uid 470, primary gid 470, our home and shell; group bh-builder with exactly gid 470; home
@@ -8,19 +9,44 @@
 # (bh-dispatch --sweep-only); only right before the account is deleted, with that identity verified, does root
 # boot out uid 470's launchd domains and kill what is left by uid (stop_uid_processes). A Directory Services query
 # that fails is never read as "absent": if the accounts cannot be listed, nothing is removed. Anything not
-# verifiably ours is left in place and reported, and the script exits 1.
+# verifiably ours is left in place and reported, and the script exits 1. Exit 0 always means uid 470's processes
+# were stopped and its per-user folders checked in this run (also when the account was already gone); exit 3 means
+# everything else was removed, but those folders were checked and are not verifiably empty. Limit: with the account
+# already gone, the by-uid stop of uid 470 has only the local directory vouching that uid 470 is free (no other
+# local account, and dscl's "not found" for bh-builder); a network-directory account would not be seen.
 set -uo pipefail
 U=bh-builder; ID=470; HOME_DIR=/Users/Shared/.bh-builder-home; PREFIX=/opt/borrowed-hands
-DELETE_TIMEOUT=120      # seconds for one `dscl . -delete /Users/bh-builder`; opendirectoryd gives up after ~310
+# Seconds for one `dscl . -delete /Users/bh-builder`. The delete waits for a person to notice and answer macOS's
+# "administer your computer" prompt, so allow minutes, not seconds; but end before opendirectoryd's own ~310 s
+# timeout (seen twice), so this script, not a bare DS Error -14987, reports what happened. One retry. Neither that
+# timeout nor killing dscl cancels the request (see "Deleting the account" below).
+DELETE_TIMEOUT=290
 
 refused=0
-# Deleting the account. Observed on a real Mac (macOS 27.2, 2026-11-09), cause NOT proven: a per-user
-# `distnoted agent` running as uid 470 appeared the second `dscl . -delete /Users/bh-builder` started, launchd
-# respawned it after a kill, and the delete hung until opendirectoryd logged "ODRecordDelete ... active for 310
-# seconds, forcing a timeout" and dscl failed with DS Error -14987 (eUndefinedError), twice in a row. With uid 470's
-# processes stopped first, the delete finished in 37 s. So the delete runs only after stop_uid_processes, with a
-# time limit, and is retried once after stopping them again. `sysadminctl -deleteUser` is not used: it also handles
-# home folders and secure tokens, and its behavior for a hidden service account was not shown to be safe here.
+# admin_prompt_notice: said once, right before the first change to the local directory (deleting the user or the
+# group). macOS may then ask '"<app>" would like to administer your computer' (TCC kTCCServiceSystemPolicySysAdminFiles,
+# attributed to the app running this terminal), and opendirectoryd holds the change until someone answers.
+ADMIN_NOTICED=0
+DELETE_TRIED=0          # set once a delete has been sent: only then can a prompt from this run be open
+admin_prompt_notice() {   # <account|group>: what this first change removes
+  [ $ADMIN_NOTICED = 1 ] && return 0
+  ADMIN_NOTICED=1
+  echo "macOS may now ask whether your terminal app may \"administer your computer\". Click Allow while this" \
+    "waits: removing the bh-builder $1 waits for that answer, and a prompt still open after this command ends" \
+    "deletes the $1 whenever it is clicked."
+}
+# Deleting the account. On a real Mac (macOS 27.2, 2026-11-09) `dscl . -delete /Users/bh-builder` hung until
+# opendirectoryd logged "ODRecordDelete ... active for 310 seconds, forcing a timeout" and dscl failed with DS Error
+# -14987 (eUndefinedError). Proven cause: at the second of the delete tccd logged AUTHREQ_PROMPTING for
+# kTCCServiceSystemPolicySysAdminFiles on behalf of the app running the terminal, and the '"<app>" would like to
+# administer your computer' prompt went unanswered; runs where it was answered finished quickly. It recurred with no
+# uid-470 process running, so stopping uid 470's processes (stop_uid_processes) does not fix it; that step stays
+# because no uid-470 process should outlive the account. So: announce the prompt, delete with a time limit, retry
+# once. Neither opendirectoryd's timeout nor killing dscl cancels the request: the prompt stays open, and Allow
+# deletes the record whenever it is clicked, with no script running (observed 637 s and 947 s after the request).
+# So a failure says so and gives the safe order: rerun first, click while it waits. `sysadminctl -deleteUser` is
+# not used: it also handles home folders and secure tokens, and its behavior for
+# a hidden service account was not shown to be safe here.
 # stop_uid_processes: only after the identity fence (uid 470 is verifiably our bh-builder and no one else's). Boots
 # out uid 470's launchd domains so nothing respawns (absent domains are fine), kills uid 470's processes by uid, and
 # polls until none remain. 0 then; 1 if some keep running or pgrep cannot tell.
@@ -44,6 +70,8 @@ stop_uid_processes() {
 # bounded <seconds> <command...>: run it in the background and wait at most that long; its exit code, or 124 if it
 # had to be killed. (macOS has no timeout(1).) Only ever our own direct child is signalled, never its children, so
 # the command must be the process itself (dscl), not a shell wrapper such as sh -c that would leave them running.
+# Every 30 s it prints WAIT_REMINDER (if set), so a long wait for a person does not look like a hang.
+WAIT_REMINDER=
 bounded() {
   local limit=$1 pid i=0; shift
   "$@" & pid=$!
@@ -55,37 +83,58 @@ bounded() {
       wait $pid 2>/dev/null       # bash reports the killed job ("Killed: 9") here: keep that off the output
       return 124
     fi
+    if [ -n "$WAIT_REMINDER" ] && (( i > 1 && (i - 1) % 30 == 0 )); then
+      echo "still waiting ($(( i - 1 )) s of $limit s): $WAIT_REMINDER"
+    fi
     sleep 1
   done
   wait $pid
 }
-# user_listed: 0 if a working `dscl . -list /Users` shows bh-builder, 1 if it works and does not, 2 if it fails (never
-# read as "absent", as in main).
-user_listed() {
-  local users
-  users=$(dscl . -list /Users UniqueID 2>/dev/null) || return 2
-  awk -v u=$U '$1 == u { f = 1 } END { exit !f }' <<<"$users"
+# record_listed <Users|Groups> <attribute>: 0 if a working `dscl . -list /<kind>` shows bh-builder, 1 if it works
+# and does not, 2 if it fails (never read as "absent", as in main).
+record_listed() {
+  local all
+  all=$(dscl . -list "/$1" "$2" 2>/dev/null) || return 2
+  awk -v u=$U '$1 == u { f = 1 } END { exit !f }' <<<"$all"
 }
-# delete_user: 0 once /Users/bh-builder is deleted; 1 (with the reason) if it is still there after one retry.
-# opendirectoryd keeps a delete running after dscl gave up and may still finish it, so a failed attempt counts as
-# done when a working listing no longer shows the account.
-delete_user() {
-  local try rc why=
+# delete_record <Users|Groups> <user|group> <attribute>: 0 once /<kind>/bh-builder is deleted; 1 (with the reason)
+# if it is still there after one retry. Done only when a working listing no longer shows the record, whatever
+# dscl's exit code says: an answered prompt can finish a delete after dscl stopped, and what dscl returns after
+# Don't Allow was not observed, so every other outcome is a failed attempt: retry once, then fail closed. Before
+# each user delete, uid 470's processes are stopped (no build process outlives its account).
+delete_record() {
+  local kind=$1 noun=$2 attr=$3 try rc why='' listed seen='seen when deleting the user' thing=account timed_out=0
+  [ "$noun" = group ] && seen='seen when deleting the user; not observed for the group' && thing=group
   for try in 1 2; do
-    stop_uid_processes || return 1
-    bounded $DELETE_TIMEOUT dscl . -delete /Users/$U; rc=$?
-    [ $rc = 0 ] && return 0
-    if [ $rc = 124 ]; then why="it did not finish within $DELETE_TIMEOUT s"; else why="dscl exit $rc"; fi
-    user_listed; if [ $? = 1 ]; then
-      echo "deleting user $U reported failure ($why), but $U is no longer listed: deleted" >&2
+    if [ "$kind" = Users ]; then stop_uid_processes || return 1; fi
+    admin_prompt_notice $thing
+    DELETE_TRIED=1
+    WAIT_REMINDER="macOS may be showing a prompt asking whether your terminal app may \"administer your computer\"\
+ (it may be behind other windows): click Allow."
+    bounded $DELETE_TIMEOUT dscl . -delete "/$kind/$U"; rc=$?
+    WAIT_REMINDER=""
+    record_listed "$kind" "$attr"; listed=$?
+    if [ $rc = 0 ] && [ $listed = 1 ]; then return 0; fi
+    if [ $rc = 0 ] && [ $listed = 0 ]; then why="dscl exit 0, but $noun $U is still listed"
+    elif [ $rc = 0 ]; then why="dscl exit 0, but the ${noun}s could not be listed to confirm it"
+    elif [ $rc = 124 ]; then why="it did not finish within $DELETE_TIMEOUT s"; timed_out=1
+    else why="dscl exit $rc"; fi
+    if [ $rc != 0 ] && [ $listed = 1 ]; then
+      echo "deleting $noun $U reported failure ($why), but $U is no longer listed: deleted" >&2
       return 0
     fi
-    [ $try = 1 ] && echo "deleting user $U failed ($why); stopping uid $ID's processes and retrying once" >&2
+    [ $try = 1 ] && echo "deleting $noun $U did not finish ($why); retrying once. If macOS shows a prompt asking" \
+      "whether your terminal app may \"administer your computer\", it is still open: click Allow now, while this" \
+      "waits (it may be behind other windows)." >&2
   done
-  echo "could not delete user $U, twice ($why). opendirectoryd can time out a record delete it cannot finish: it" \
-    "logs 'ODRecordDelete ... forcing a timeout' and dscl reports DS Error -14987 (eUndefinedError). Observed on" \
-    "macOS 27.2, cause not proven: a uid-$ID distnoted agent starts during the delete; stopping uid $ID's processes" \
-    "first let it complete. Check with: ps -U $ID; log show --last 15m --predicate 'process == \"opendirectoryd\"'" >&2
+  # Only a timeout shows that a prompt was waiting; a quick failure (perhaps Don't Allow, not observed) does not.
+  local open="That prompt may still be open, and if it is, it still works" cause="the delete did not go through"
+  [ $timed_out = 1 ] && open="That prompt is still open and still works" && cause="nobody answered"
+  echo "could not delete $noun $U, twice ($why). Most likely macOS asked whether your terminal app may \"administer" \
+    "your computer\" ($seen) and $cause. $open: clicking Allow at any time deletes the $noun $U at that moment," \
+    "even though this command has ended. So run 'bh uninstall' again first, and click Allow while it waits; if it" \
+    "was already clicked, that rerun finishes the removal. What happens after Don't Allow was not observed. Check" \
+    "with: log show --last 30m --predicate 'process == \"tccd\" AND eventMessage CONTAINS \"SysAdminFiles\"'" >&2
   return 1
 }
 refuse() { echo "left in place: $*" >&2; refused=1; }
@@ -224,7 +273,7 @@ main() {
   [ "$(id -u)" = 0 ] || { echo "run with sudo" >&2; exit 1; }
   cd /
   launchctl print system/com.borrowedhands.runner >/dev/null 2>&1 && launchctl bootout system/com.borrowedhands.runner
-  local users groups others ours=0 had_user=0 had_group=0 fail=0 kind rc
+  local users groups others ours=0 had_user=0 had_group=0 fail=0 kind rc orphan_folders=0 keep_prefix=0 readout
   users=$(dscl . -list /Users UniqueID 2>/dev/null) && groups=$(dscl . -list /Groups PrimaryGroupID 2>/dev/null) || {
     echo "could not inspect the user accounts (dscl failed); nothing was removed. Retry, or check: dscl . -list /Users" >&2
     exit 1
@@ -260,17 +309,42 @@ main() {
         exit 1
       fi
       # Keep the dispatcher on failure too: a rerun needs it to sweep before it may try again.
-      if ! delete_user; then
-        echo "kept user $U and $PREFIX so 'bh uninstall' (or this script) can retry" >&2
+      if ! delete_record Users user UniqueID; then
+        if [ $DELETE_TRIED = 1 ]; then
+          echo "kept user $U and $PREFIX for now (an open prompt can still delete the account, see above) so" \
+            "'bh uninstall' (or this script) can retry" >&2
+        else
+          echo "kept user $U and $PREFIX so 'bh uninstall' (or this script) can retry" >&2
+        fi
         exit 1
       fi
       ours=1
     elif [ $rc = 2 ]; then
       refuse "could not inspect user $U (dscl . -read /Users/$U failed); not removing it, its group, home or caches"
+      keep_prefix=1         # the account stays, so a rerun needs the dispatcher to sweep before it may remove it
     else
       refuse "user $U is not the Borrowed Hands build user (expected exactly uid $ID, gid $ID, home $HOME_DIR," \
         "shell /usr/bin/false); not removing it, its group, home or caches"
     fi
+  else
+    # The account is already gone and no other account holds uid 470: most often a prompt from an earlier run was
+    # answered after that run ended, which deleted bh-builder then. Check what can be checked without the account
+    # before removing the rest, so that exit 0 always means "checked": no process may still run as uid 470 (stop
+    # them as a normal run does; uid 470 belongs to no account), and its per-user folders must be verifiably the
+    # empty protected skeleton. Without the account nothing here removes them, so the check is read-only.
+    # A listing that merely omits the account is not enough: require dscl's own "not found" for it first.
+    readout=$(dscl . -read /Users/$U 2>&1); rc=$?
+    if [ $rc = 0 ] || [[ $readout != *eDSRecordNotFound* ]]; then
+      echo "$U is not in the account list, but reading it did not confirm it is gone (dscl exit $rc): not" \
+        "confirmed, so nothing was stopped or removed. Retry, or check: dscl . -read /Users/$U" >&2
+      exit 1
+    fi
+    if ! stop_uid_processes; then
+      echo "the $U account is already gone, but processes still run as uid $ID; removed nothing. Investigate:" \
+        "ps -U $ID" >&2
+      exit 1
+    fi
+    caches_cleared 0 || orphan_folders=1
   fi
   # The group, home and caches are ours only while no other account holds uid 470 and the user is ours or gone.
   local clear=0
@@ -278,7 +352,7 @@ main() {
   if [ $had_group = 1 ] && [ $clear = 1 ]; then
     attr_is /Groups/$U PrimaryGroupID $ID; rc=$?
     if [ $rc = 0 ]; then
-      dscl . -delete /Groups/$U || { echo "could not delete group $U" >&2; fail=1; }
+      delete_record Groups group PrimaryGroupID || fail=1
     elif [ $rc = 2 ]; then
       refuse "could not inspect group $U (dscl . -read /Groups/$U failed)"
     else
@@ -300,8 +374,17 @@ main() {
       || echo "warning: could not reset modes under $HOME_DIR" >&2
     rm -rf "$HOME_DIR" || { echo "could not remove $HOME_DIR" >&2; fail=1; }
   fi
-  if [ -d "$PREFIX" ]; then rm -rf "$PREFIX" || { echo "could not remove $PREFIX" >&2; fail=1; }; fi
+  if [ $keep_prefix = 1 ]; then
+    refuse "$PREFIX: kept with the account, for the retry"
+  elif [ -d "$PREFIX" ]; then rm -rf "$PREFIX" || { echo "could not remove $PREFIX" >&2; fail=1; }; fi
   [ $fail = 0 ] && [ $refused = 0 ] || exit 1
+  if [ $orphan_folders = 1 ]; then          # exit 3: everything else removed; these folders checked and not clean
+    echo "the $U account was already gone (most often a prompt from an earlier run answered after it ended):" \
+      "removed its group, $HOME_DIR and $PREFIX, but uid $ID's per-user folders under /private/var/folders could" \
+      "not be verified empty (see above), and without the account nothing here removes them. 'bh setup' checks" \
+      "them again as root before it creates $U and prints the one safe removal command." >&2
+    exit 3
+  fi
   echo "removed $U, $HOME_DIR, $PREFIX"
 }
 

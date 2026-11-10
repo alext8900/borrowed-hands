@@ -132,7 +132,7 @@ in which RFC 8785 and the one-line Python form below produce identical bytes:
 
 Reference implementation, both sides:
 `json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")`
-after validating the subset. Python is the only implementation in 0.1. Any other implementation must reproduce
+after validating the subset. Python is the only implementation in 0.2. Any other implementation must reproduce
 every vector in `protocol/test-vectors/vectors.json` (canonical bytes, rejects, Ed25519 signatures, fingerprints,
 key ids, pairing string).
 
@@ -249,7 +249,7 @@ line) in `~/Library/Application Support/BorrowedHands/device_ed25519.key`. Requi
 - It is loaded with `open(O_RDONLY|O_NOFOLLOW)` and then `fstat`: a regular file, owned by the user, mode 0600,
   `nlink == 1`; otherwise refuse.
 - Rotation is section 3.6. The old key file is overwritten via the same atomic path and never kept.
-- No Keychain in 0.1: an ACL prompt would block an unattended agent.
+- No Keychain in 0.2: an ACL prompt would block an unattended agent.
 
 Residual risk: any process running as the same macOS user can read this file (and edit the grants in
 `config.toml`). Same-user compromise of the Mac is out of scope (section 8).
@@ -260,9 +260,22 @@ Residual risk: any process running as the same macOS user can read this file (an
   non-terminal jobs on the server side (state `cancelled`, `detail.reason: "revoked"`), sends `unpaired` if
   connected, then closes 4403. A revoked helper_id can never authenticate again.
 - **From the Mac:** `bh unpair` sends `unpair` (signed frame) if connected and waits up to 5 s for `ack`, then
-  deletes its pins, device key and job database. It always deletes local state, even offline. The server, on
-  `unpair`, sets `revoked_at` and queues an owner notice. An offline unpair leaves a stale server row that can never
-  authenticate (no key) and that `/hands status` shows until `/hands unpair` removes it.
+  deletes its pins, device key and job database. It always deletes local state, even offline, and whatever the
+  server does: connecting (15 s, the answer to the WebSocket upgrade included), the handshake (10 s), the `ack`
+  (5 s) and the close (5 s) are each bounded, and one deadline of their sum plus 2 s covers them all. The server, on
+  `unpair`, sets `revoked_at` and queues an owner notice. An offline unpair leaves a stale server row that
+  `/hands status` shows until `/hands unpair` removes it. That row can never authenticate again once no helper
+  process is alive: a helper that was running holds the key in memory until it stops. So `bh unpair` stops the
+  background service first, and says the pairing is deleted (exit 0) only when the helper lock is free; otherwise
+  it deletes the files, says a helper is still running and exits 1. A running helper also checks the file itself:
+  when `config.toml` has no `[server]` or another one (other than the new pin of a key rotation this helper is
+  writing at that moment), it cancels every job as
+  `revoked`, starts no further job, drops the key from memory, leaves the file as it is and exits (3 if unpaired,
+  1 if another server is named). It notices on its next poll (every 2 s), not instantly, and waits at most 5 s for
+  the server to answer the close.
+- **Server key rotation** writes the new pin only if the file still holds the old one (compare under the config
+  lock). If the owner removed or changed the pin, nothing is written, the helper answers `error` (`denied`,
+  `detail.reason: "pin_changed"`) and stops as above.
 - On receiving `unpaired` or 4403, the helper cancels running work (runner kill path), deletes pins and the device key,
   and exits 3 ("unpaired by server").
 
@@ -361,7 +374,7 @@ received --(checks 7-13 pass)--> queued --> materializing --> building --> succe
    queued | materializing | building --> cancelled
 ```
 
-- `materializing` is reserved: in 0.1 the dispatcher reports nothing until it finishes, so the helper goes from
+- `materializing` is reserved: in 0.2 the dispatcher reports nothing until it finishes, so the helper goes from
   `queued` straight to `building` when it starts `bh-dispatch`, and covers checkout and build with that one state.
 - `succeeded`: xcodebuild exit 0 and result status `succeeded`. `failed`: anything else that ran, including compile
   errors (`error.code` absent, `result.status: "failed"`) and timeouts (`error.code: "timeout"`).
@@ -463,7 +476,7 @@ Request deadlines (server waiting on the helper): `job.submit` reply 150 s (cove
 Sent at seq 1 and again whenever local config changes (the helper watches the config file mtime):
 
 ```json
-{"helper_version": "0.1.0", "name": "Alexs MacBook Pro", "os": "macos", "os_version": "26.2", "arch": "arm64",
+{"helper_version": "0.2.0", "name": "Alexs MacBook Pro", "os": "macos", "os_version": "26.2", "arch": "arm64",
  "busy": false, "queue_depth": 0,
  "capabilities": [
    {"name": "system.info", "v": 1},
@@ -502,7 +515,7 @@ version  := digits ("." digits){0,3}
 `additionalProperties: false`, so any field change bumps `v`, regenerates the schemas and the test vectors, and needs
 Alex's sign-off. Hackathon scope: no negotiation.
 
-## 8. Residual risks (accepted for 0.1)
+## 8. Residual risks (accepted for 0.2)
 
 - **Server signing-key compromise.** Whoever holds `server_ed25519.key` (the Railway volume, or anyone with shell
   access to the deployment) can mint valid contracts and frames for every paired Mac. The Mac still enforces its
@@ -510,12 +523,29 @@ Alex's sign-off. Hackathon scope: no negotiation.
   workspaces' commits that are on `bh/*` branches, captures if enabled, and system info. Mitigations: `bh unpair`
   on every Mac, narrow grants, and `HERMES_MEDIA_DELIVERY_STRICT=1` on the gateway, which reduces chat delivery of
   the key file (exceptions in the plugin README). There is no revocation list and `/hands rotate-key` is not
-  available in 0.1; re-pairing with a new key is the response (QUICKSTART.md "If the server key leaks").
+  available in 0.2; re-pairing with a new key is the response (QUICKSTART.md "If the server key leaks").
 - **Same-user compromise on the Mac.** Malware running as the Mac's user can read the device key, edit `config.toml`
   grants and impersonate the helper. Out of scope; the sandbox protects the user from builds, not the other way round.
+- **Unpair and revoke take effect on the helper's next poll.** A running helper reads `config.toml` every 2 s, so a
+  revoked grant or a removed pairing can stay usable for up to that long, and longer if the file cannot be read (the
+  helper retries and keeps the last version it accepted). `bh unpair` exits 1 and says so when it cannot confirm
+  the helper stopped.
+- **A paired server that stops reading its socket can delay that poll.** The helper's sends then wait on the
+  connection, and the poll waits behind them, for as long as the server keeps the connection up while it sends a
+  frame now and then. Until it reads again, a removed pairing, `bh grant revoke`, `bh cancel` and `bh caps
+  disable` may not take effect, although `bh grant revoke` and `bh cancel` print "within a few seconds"; one
+  `system.info` job can still run. A build that is running is cancelled first, without a send, when its grant is revoked or the
+  pairing is removed, but only if the poll was not already waiting. No new build starts while the sends wait.
+  Stopping the helper (Ctrl-C for `bh run`, `bh service uninstall` for the background service) always works.
+  Not fixed in 0.2: a send has no deadline that retires the socket.
+- **Known small gaps in `bh grant` (not fixed in 0.2).** Repo URLs and project paths are printed to the
+  terminal without escaping control characters; a far-future `--expires` (year 10000 and later) ends in a Python
+  traceback instead of a clean error; `bh grant list` shows expiry in local time without naming the zone; and an I/O error while writing
+  `config.toml` (disk full, permissions) can surface as a traceback and leave a temporary file beside it. None of
+  these writes a grant the owner did not ask for.
 - **Railway edge.** It cannot forge or replay frames (signatures, seq, sid, exp), but it can drop or delay them and
   see their contents (repo fingerprints, schemes, diagnostics, screenshots). Confidentiality from the hosting provider
-  is not a 0.1 goal.
+  is not a 0.2 goal.
 - **Hostile DNS for the git remote.** It can choose which public address git talks to; the tree check makes that
   equivalent to a hostile remote (SANDBOX.md "Ship decision: DNS rebinding").
 - **Build metadata reads.** A build can stat known paths outside its allowlist (SANDBOX.md gap 1).

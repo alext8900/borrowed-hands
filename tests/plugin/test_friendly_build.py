@@ -101,8 +101,9 @@ def env(data_dir, monkeypatch):
     lst = SimpleNamespace(running=True, is_online=lambda hid: hid in online)
     submitted = []
 
-    def submit_and_wait(helper_id, action, params, wait_s, ref, session_id="", deadline=None):
-        submitted.append({"helper_id": helper_id, "action": action, "params": params, "ref": ref})
+    def submit_and_wait(helper_id, action, params, wait_s, ref, session_id="", deadline=None, source=None):
+        submitted.append({"helper_id": helper_id, "action": action, "params": params, "ref": ref,
+                          "source": source})
         return {"ok": True, "job_id": "3f2b8c1e-9a4d-4e6f-8b2a-1c3d5e7f9a0b", "helper_id": helper_id,
                 "action": action, "state": "succeeded", "helper_online": True}
     jobs = SimpleNamespace(listener_unavailable=lambda: None, submit_and_wait=submit_and_wait)
@@ -138,8 +139,8 @@ def run(args, sid="s", cid="c1"):
 def test_omitted_commit_with_one_bh_branch_mints_that_sha(env):
     d, r = run({})
     assert d["action"] == "approve"
-    assert d["message"] == ("Build demo (scheme Demo, Debug, macOS arm64) at commit 3449717 "
-                            "(latest on bh/fixed) on Macbook Pro M5 Max")
+    assert d["message"] == ("Build at commit 3449717404 (latest on bh/fixed) on Macbook Pro M5 Max. " + hooks.SCOPE_HINT
+                            + " Settings: demo (scheme Demo, Debug, macOS arm64)")
     assert r["ok"] is True and len(env.submitted) == 1
     p = env.submitted[0]["params"]
     assert p == {"workspace_id": "demo", "repo_fingerprint": FP, "commit": SHA_FIXED, "scheme": "Demo",
@@ -164,7 +165,7 @@ def test_handler_builds_the_approved_sha_even_if_the_branch_moves(env):
 def test_named_branch_uses_that_tip(env):
     env.set_net(pairs=[("refs/heads/bh/a", SHA_OTHER), ("refs/heads/bh/fixed", SHA_FIXED)])
     d, r = run({"branch": "bh/a"})
-    assert "at commit bbbbbbb (latest on bh/a)" in d["message"]
+    assert "at commit bbbbbbbbbb (latest on bh/a)" in d["message"]
     assert r["ok"] and env.submitted[0]["params"]["commit"] == SHA_OTHER
 
 
@@ -396,7 +397,8 @@ EXPLICIT = {"helper_id": HID, "workspace_id": "demo", "repo_url": REPO, "commit"
 def test_explicit_commit_path_is_unchanged(env):
     env.set_net(exc=AssertionError("no network for an explicit commit"))
     d, r = run(EXPLICIT)
-    assert d["message"] == "Build demo (scheme Demo, Debug, macOS arm64) at commit 5555555 on Macbook Pro M5 Max"
+    assert d["message"] == ("Build at commit 5555555555 on Macbook Pro M5 Max. " + hooks.SCOPE_HINT
+                            + " Settings: demo (scheme Demo, Debug, macOS arm64)")
     assert d["rule_key"] == hooks.rule_key("hands_xcode_build", {**EXPLICIT})
     assert r["ok"] and "resolved" not in r and env.net.urls == []
     assert env.submitted[0]["params"] == {"workspace_id": "demo", "repo_fingerprint": FP, "commit": "5" * 40,

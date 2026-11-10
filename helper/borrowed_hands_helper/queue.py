@@ -127,12 +127,19 @@ class Lane(Generic[J]):
         return False
 
     async def cancel_matching(self, pred: Callable[[J], bool], reason: str) -> int:
+        """The running job first: its cancel only reaches the executor, while dropping a queued job reports to the
+        server and can wait on a connection that is not being read. Nothing is dequeued meanwhile."""
         n = 0
-        for j in self.q.queued():
-            if pred(j):
-                n += await self.cancel(j.job_id, reason)
-        if self.q.active is not None and pred(self.q.active):
-            n += await self.cancel(self.q.active.job_id, reason)
+        held, self._held = self._held, True
+        try:
+            queued = self.q.queued()
+            if self.q.active is not None and pred(self.q.active):
+                n += await self.cancel(self.q.active.job_id, reason)
+            for j in queued:
+                if pred(j):
+                    n += await self.cancel(j.job_id, reason)
+        finally:
+            self.hold(held)
         return n
 
     async def run(self) -> None:

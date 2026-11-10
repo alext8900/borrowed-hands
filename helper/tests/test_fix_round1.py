@@ -32,7 +32,7 @@ REPO = Path(__file__).resolve().parents[2]
 def edit_grant(home, **changes):
     cfg = config.load(home)
     ws = dataclasses.replace(cfg.workspace("demo"), **changes)
-    config.save(home, cfg.with_workspace(ws))
+    config.save(home, cfg.with_workspace(ws, replace_existing=True))
     os.utime(home / config.CONFIG_NAME, ns=(time.time_ns(), time.time_ns() + 10**9))
 
 
@@ -502,7 +502,7 @@ def test_service_program_from_a_real_uv_tool_install(tmp_path):
     assert argv[0].startswith(str(tmp_path / "tools")), argv
     out = subprocess.run(argv[:-1] + ["--version"], capture_output=True, text=True, timeout=60,
                          env={"PATH": "/usr/bin:/bin"})
-    assert out.returncode == 0 and out.stdout.strip() == "bh 0.1.0", out.stderr
+    assert out.returncode == 0 and out.stdout.strip() == "bh 0.2.0", out.stderr
 
 
 # ------------------------------------------------------------------ LOW 7

@@ -64,6 +64,14 @@ if ! dscl . -read /Users/$U >/dev/null 2>&1 &&
   }
 fi
 
+# Deleting bh-builder makes macOS ask '"<app>" would like to administer your computer' (TCC, attributed to the app
+# running this terminal), and an unanswered prompt stays open after the uninstall ended; Allow then deletes the
+# account. Creating the account has never been seen to ask (the unified log shows no SysAdminFiles request there),
+# so a prompt on screen now is most likely such a leftover: say so instead of telling the user to click it.
+echo "Creating the account has not been seen to ask for permission. If macOS shows a prompt asking whether your" \
+  "terminal app may \"administer your computer\" now, it is most likely an earlier 'bh uninstall' still waiting to" \
+  "delete bh-builder, and Allow would delete it: do not click Allow; finish 'bh uninstall' first" \
+  "(docs/QUICKSTART.md, Uninstall)."
 # --- group
 if dscl . -read /Groups/$U >/dev/null 2>&1; then
   [ "$(dscl . -read /Groups/$U PrimaryGroupID | awk '{print $2}')" = $ID ] || { echo "group $U exists with wrong gid" >&2; exit 1; }

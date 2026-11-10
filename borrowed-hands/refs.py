@@ -26,7 +26,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
-from . import bhproto
+from . import bhproto, hooks
 
 BRANCH_PATTERN = "^bh/[A-Za-z0-9._/-]+$"
 _BRANCH = re.compile(r"bh/[A-Za-z0-9._/-]+")
@@ -390,7 +390,7 @@ def bh_branches(refs: Dict[str, str]) -> Dict[str, str]:
 
 
 def _listing(names: List[str]) -> str:
-    shown = ", ".join(names[:MAX_LISTED])
+    shown = ", ".join(hooks.label(n) for n in names[:MAX_LISTED])   # remote-controlled: quoted, capped
     return shown + (f", and {len(names) - MAX_LISTED} more" if len(names) > MAX_LISTED else "")
 
 
@@ -401,7 +401,7 @@ def resolve(repo_url: str, branch: Optional[str]) -> Tuple[str, str, str]:
     if branch is not None:
         if branch not in branches:
             raise RefsError("needs_resolution", "branch_not_found",
-                            f"There is no branch {branch} on the repository. "
+                            f"There is no branch {hooks.label(branch)} on the repository. "
                             + (f"Its bh/* branches: {_listing(names)}." if names else
                                "It has no bh/* branch; push the code to bh/<name> first.")
                             + " Nothing was built.", options=names[:MAX_LISTED], total=len(names))
@@ -412,7 +412,8 @@ def resolve(repo_url: str, branch: Optional[str]) -> Tuple[str, str, str]:
                         "to a branch named bh/<name> (for example bh/main) and ask again. Nothing was built.")
     if len(names) > 1:
         raise RefsError("invalid_arguments", "needs_input",
-                        f"The repository has {len(names)} bh/* branches: {_listing(names)}. Ask the user which "
-                        "one to build, then call again with branch set to it.", field="branch",
+                        f"The repository has {len(names)} bh/* branches: {_listing(names)}. Use the branch you pushed "
+                        "or the user named, else ask the user which one to build, then call again with branch set "
+                        "to it.", field="branch",
                         options=names[:MAX_LISTED], total=len(names))
     return branches[names[0]], names[0], f"latest on {names[0]}"

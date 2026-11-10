@@ -5,12 +5,46 @@
 #  - config.default.yaml is copied only when no config.yaml exists; an existing one is never overwritten, only
 #    given the plugins.enabled entry if that is missing (comments and other keys kept);
 #  - plugin-data/ (server key, pairings, job db) is never touched.
-# BH_ROOT, BH_PY and BH_ENTRYPOINT exist for tests; the image uses the defaults.
+#  - optional GitHub push credential (BH_GITHUB_TOKEN, sealed, + BH_GITHUB_REPO=owner/name): written by
+#    bh-github-creds.py to two 0600 files in /etc/bh-github/creds (hermes 0700 dir in a root 0755 dir on the
+#    container filesystem: new in every container, never on the volume) plus a root-owned, URL-scoped git config;
+#    removed again when the token variable is removed or invalid. Every start also sweeps the old volume location
+#    $H/.config/bh-github. This runs first, before any check that can exit, so a start without the token always
+#    removes an old credential.
+#    Both variables are unset on the next lines, before any child runs, so no child of this script, nothing in s6's
+#    container environment and nothing under Hermes inherits them (the repo too, in case the token is pasted into the
+#    wrong one). The kernel's copy in /proc/<this pid>/environ keeps them until the final exec replaces this process;
+#    nothing of the gateway's uid runs before then. They reach the helper on stdin (printf is a builtin: never argv)
+#    and are never printed. Never add set -x.
+#  - the script's own commands use a fixed system PATH (the image PATH puts /opt/data/.local/bin, which the gateway
+#    can write, ahead of the system dirs); the caller's PATH is restored for the exec.
+# BH_ROOT, BH_PY, BH_ENTRYPOINT and BH_GITCONFIG exist for tests; the image uses the defaults.
 set -e
+bh_github_token="${BH_GITHUB_TOKEN-}"
+bh_github_repo="${BH_GITHUB_REPO-}"
+unset BH_GITHUB_TOKEN BH_GITHUB_REPO
+bh_path_set="${PATH+x}"
+bh_path="${PATH-}"
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
 H="${HERMES_HOME:-/opt/data}"
 R="${BH_ROOT:-/opt/bh}"
 PYBIN="${BH_PY:-/opt/hermes/.venv/bin/python}"
 ENTRY="${BH_ENTRYPOINT:-/opt/hermes/docker/entrypoint-dispatch.sh}"
+GC="${BH_GITCONFIG:-/etc/bh-github/gitconfig}"
+# Never fails the boot: any refusal or error leaves no usable credential and Hermes starts as in V1.
+if ! {
+  printf '%s\000%s' "$bh_github_repo" "$bh_github_token" | \
+    "$PYBIN" -I "$R/bh-github-creds.py" "$H" "$GC"
+}; then
+  # The git config's directory is root's and off the volume, and nothing of the gateway's uid runs yet, so removing
+  # it and the credential directory here is safe (rm -r never follows a link inside). The old volume location
+  # could not be checked.
+  rm -rf -- "$GC" "${GC%/*}/creds"
+  echo "[bh-start] github credentials: helper failed; git config and ${GC%/*}/creds removed, but the old" \
+    "location $H/.config/bh-github was NOT checked and may still hold an old token; revoke it at GitHub if in doubt" >&2
+fi
+bh_github_token= bh_github_repo=
 # The gateway owns this directory. Root must never follow a config entry it can replace.
 if [ -L "$H/config.yaml" ] || { [ -e "$H/config.yaml" ] && [ ! -f "$H/config.yaml" ]; }; then
   echo "[bh-start] ERROR: config.yaml must be a regular file, not a symlink" >&2
@@ -124,4 +158,14 @@ if [ "$(id -u)" = 0 ] && [ -d "$H/logs" ]; then
   chown -R -P hermes:hermes "$H/logs"
 fi
 echo "[bh-start] seeded $H uid=$(id -u) pid=$$" >&2
+# Hand git the credential config through the environment, the only place that names it; git reads it after every
+# config file. Its `helper =` reset then drops helpers a user-level config adds for the repository URL (the bundled
+# GitHub skill suggests `credential.helper store`), so git never copies the token into ~/.git-credentials. A child
+# started without these variables (Hermes's execute_code, stdio MCP servers) gets no credential. Not secret.
+bh_n="${GIT_CONFIG_COUNT:-0}"
+case "$bh_n" in ''|*[!0-9]*|0?*|?????*) bh_n=0 ;; esac
+eval "GIT_CONFIG_KEY_$bh_n=include.path GIT_CONFIG_VALUE_$bh_n=\"\$GC\"; export GIT_CONFIG_KEY_$bh_n GIT_CONFIG_VALUE_$bh_n"
+GIT_CONFIG_COUNT=$((bh_n + 1))
+export GIT_CONFIG_COUNT
+if [ -n "$bh_path_set" ]; then PATH="$bh_path"; else unset PATH; fi
 exec "$ENTRY" "$@"

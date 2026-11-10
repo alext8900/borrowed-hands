@@ -16,6 +16,7 @@ bad() { echo "FAIL $1"; fail=1; }
 mkdir -p "$T/bh/plugins/borrowed-hands"
 echo "v1" > "$T/bh/plugins/borrowed-hands/__init__.py"
 printf 'plugins:\n  enabled:\n    - borrowed-hands\n  disabled: []\n' > "$T/bh/config.default.yaml"
+cp "$ROOT/deploy/railway/bh-github-creds.py" "$T/bh/bh-github-creds.py"
 cat > "$T/entry.sh" <<'E'
 #!/bin/sh
 echo "ENTRY $*" > "$BH_TEST_OUT"

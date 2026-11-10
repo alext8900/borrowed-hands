@@ -6,6 +6,10 @@ USER root
 COPY --chmod=0755 borrowed-hands /opt/bh/plugins/borrowed-hands
 COPY --chmod=0644 deploy/railway/config.yaml /opt/bh/config.default.yaml
 COPY --chmod=0755 deploy/railway/bh-start.sh /opt/bh/bh-start.sh
+COPY --chmod=0644 deploy/railway/bh-github-creds.py /opt/bh/bh-github-creds.py
+# Optional GitHub push credential: bh-start.sh writes /etc/bh-github/gitconfig at every start and names it only in
+# the GIT_CONFIG_* variables it hands to Hermes. There is deliberately no system-level include: a process started
+# without those variables gets no credential at all, instead of one without the helper reset that comes with them.
 # BH_LISTEN=1 only switches the listener on. The plugin still requires the process to be `hermes gateway run`,
 # so `hermes plugins validate`, doctor and CLI processes never open the port.
 # Only for Railway edge ingress. Generic plugin installs leave trusted-proxy handling off.

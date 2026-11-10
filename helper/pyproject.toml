@@ -1,6 +1,6 @@
 [project]
 name = "borrowed-hands-helper"
-version = "0.1.0"
+version = "0.2.0"
 description = "Mac-side helper for Borrowed Hands: pairs with your Hermes gateway and runs only what you granted"
 requires-python = ">=3.11"
 dependencies = ["aiohttp>=3.9,<4", "cryptography>=42,<51"]

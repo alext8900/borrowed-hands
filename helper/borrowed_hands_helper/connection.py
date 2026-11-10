@@ -45,6 +45,7 @@ class Timing:
     backoff_base_s: float = 1.0
     backoff_cap_s: float = 60.0
     connect_s: float = 15.0
+    close_s: float = 5.0           # a server that never answers CLOSE cannot keep the helper from exiting
 
 
 def backoff_delay(attempt: int, rand: Callable[[], float] = random.random, timing: Timing = Timing()) -> float:
@@ -111,13 +112,18 @@ class AiohttpTransport:
         import aiohttp
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=timing.connect_s))
         try:
-            ws = await session.ws_connect(url, protocols=(SUBPROTOCOL,), autoping=False, heartbeat=None,
-                                          max_msg_size=bhproto.MAX_FRAME, autoclose=True)
+            # connect_s bounds the answer to the upgrade too: the session timeout covers only the TCP and TLS connect
+            ws = await asyncio.wait_for(session.ws_connect(
+                url, protocols=(SUBPROTOCOL,), autoping=False, heartbeat=None, max_msg_size=bhproto.MAX_FRAME,
+                autoclose=True), timing.connect_s)
         except Exception as e:
             await session.close()
             raise ConnectFailed(f"{type(e).__name__}: {e}") from None
         if ws.protocol != SUBPROTOCOL:
-            await ws.close(code=1002)
+            try:
+                await asyncio.wait_for(ws.close(code=1002), timing.close_s)
+            except asyncio.TimeoutError:
+                pass
             await session.close()
             raise ConnectFailed("server did not accept the bh.v1 subprotocol")
         return cls(session, ws, timing)
@@ -133,12 +139,12 @@ class AiohttpTransport:
                 now = time.monotonic()
                 if now - self._last_in > self._timing.dead_s:
                     self.dead = True
-                    await self._ws.close(code=1001)
+                    await asyncio.wait_for(self._ws.close(code=1001), self._timing.close_s)
                     return
                 if now >= next_ping:
                     next_ping = now + self._timing.heartbeat_s
                     await self._ws.ping()
-        except (asyncio.CancelledError, ConnectionError, RuntimeError):
+        except (asyncio.CancelledError, asyncio.TimeoutError, ConnectionError, RuntimeError):
             pass
 
     async def send(self, text: str) -> None:
@@ -170,7 +176,11 @@ class AiohttpTransport:
         self._hb.cancel()
         try:
             if not self._ws.closed:
-                await self._ws.close(code=code)
+                # aiohttp restarts its own wait for every frame that is not CLOSE, so a server that keeps sending
+                # could hold this open for good
+                await asyncio.wait_for(self._ws.close(code=code), self._timing.close_s)
+        except asyncio.TimeoutError:
+            pass                         # the server withheld its CLOSE: drop the socket without it
         finally:
             await self._session.close()
 
@@ -382,7 +392,7 @@ async def run_forever(get_pin: Callable[[], ServerPin], get_key: Callable[[], ob
                 raise
             finally:                     # every transport we created is closed, on every path
                 try:
-                    await t.close(close_with)
+                    await asyncio.wait_for(t.close(close_with), timing.close_s)
                 except Exception:
                     pass
         except Stop as s:

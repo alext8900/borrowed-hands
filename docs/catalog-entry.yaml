@@ -1,26 +1,25 @@
-# Hermes plugin catalog entry for Borrowed Hands.
-# sha is pinned to the published commit after the repository is pushed; revalidate against the catalog schema
-# (NousResearch/hermes-agent plugin-catalog/README.md) at submission time.
+# Copy of the Hermes plugin catalog entry for Borrowed Hands 0.2.0, kept here for reference.
+# The live entry is plugin-catalog/borrowed-hands.yaml in NousResearch/hermes-agent. Its sha names a commit of
+# this repository, so it cannot be recorded in that same commit: the catalog's value is the one that counts.
 name: borrowed-hands
-repo: 'https://github.com/alext8900/borrowed-hands'
-sha: 'SET_AFTER_PUBLISH'
+title: Borrowed Hands
+repo: https://github.com/alext8900/borrowed-hands
+sha: 'SET_IN_THE_CATALOG'
 subdir: borrowed-hands
-description: >-
-  Borrow a paired Mac's locally granted Xcode compiler from Hermes and return structured diagnostics.
+version: "0.2.0"
+description: "Lend your Mac's Xcode to a cloud Hermes. Hermes finds your paired Mac, compiles the Xcode project you granted (macOS arm64 or generic iOS Simulator, compile only) at an exact commit on a bh/* branch, and gets structured compiler diagnostics back: ask \"Build my demo project on my Mac\", or have Hermes edit a repository with its own git tools, build its bh/* branch, fix what the compiler reports and check with `hands_job` `check_pr_ready` before it opens a pull request (the plugin never pushes, opens pull requests or holds GitHub credentials). Needs the separate Borrowed Hands Mac helper (Python source in the same repository) on an Apple silicon Mac with Xcode; the Mac connects out to Hermes and decides what may build. Disclosure — when `listen.enabled` is set (off by default) the plugin runs an HTTP/WebSocket listener inside `hermes gateway run` (default bind `0.0.0.0:8790`, routes `/bh/v1/ws` and an unauthenticated `/bh/v1/healthz`) that paired Macs dial into; connections are authenticated by a single-use pairing code and per-device Ed25519 keys. It keeps a server signing key and a SQLite database (paired device keys, signed job contracts, build diagnostics, audit log) in its plugin data dir; anything the agent can reach on the gateway host can read that key, and a holder of it can sign build requests to paired Macs within their grants. For a build with no commit it makes one anonymous HTTPS read of the granted public repository's branch list (public addresses only, no credentials, no redirects). With `check_pr_ready` it makes one more such read, for that build's repository. It registers one read-only skill, `borrowed-hands:xcode-build-pr` (text only: the order to use the tools in), and its system prompt section tells the agent to run the bundled standard-library script `templates/new_swiftui_app.py` with its own shell tool to write a new Xcode project into its working directory (no process, no network, nothing overwritten). `/hands whoami`, in a DM, tells any sender their own platform:user_id and nothing else. Builds ask for Hermes approval; an \"always\" answer covers the same Mac, workspace, scheme, configuration and destination but not the commit or branch, so later commits build without a new prompt. The separate Mac helper is installed by the user from the repository, is not covered by this catalog pin, and installs a LaunchAgent, a hidden build user, a root-owned dispatcher and a sudo rule limited to six exact dispatcher commands. No telemetry, no self-update."
 maintainer: alext8900
 tier: community
 category: tools
-requires_hermes: '>=0.22.7'
-version: '0.1.0'
-# Server plugin platforms; the separate build helper requires an Apple silicon Mac with Xcode.
-platforms: [linux, macos]
-# readme resolves under subdir; that README discloses the separate Mac install and capture stub.
+docs_url: https://github.com/alext8900/borrowed-hands/blob/main/docs/QUICKSTART.md
+requires_hermes: ">=0.22.7"
 readme: true
+platforms: [linux, macos]
 known_issues:
-  - 'hands_screen_capture is registered but unavailable: no helper executor in this version.'
-  - 'iOS Simulator support is compile-only; no boot, install, UI or tests.'
-  - 'Public HTTPS repositories and bh/* commits only; remote Swift packages are unsupported.'
-  - 'Recorded builds report wipe_ok=false for protected per-user state; full persistent-state removal is not established.'
+  - "hands_screen_capture is registered but unavailable: no helper executor in this version."
+  - "iOS Simulator support is compile-only: no boot, install, UI or tests."
+  - "Public HTTPS repositories and bh/* commits only; private repositories and remote Swift packages are unsupported."
+  - "Builds report wipe_ok=false for protected per-user state; complete persistent-state removal is not established."
 capabilities:
   provides_tools:
     - hands_find

@@ -88,7 +88,7 @@ print(json.dumps([{ 'path':p, 'uid':os.stat(p).st_uid, 'gid':os.stat(p).st_gid,'
     print('OWNERSHIP ' + label + ' ' + json.dumps(permissions), flush=True)
     lines = py(name, "from pathlib import Path; print('\\n'.join(l for l in Path('/opt/data/logs/agent.log').read_text().splitlines() if 'borrowed_hands:' in l))")
     print('LISTENER ' + label + '\n' + lines, flush=True)
-    assert lines.count('listener up on') == registrations and lines.count('registered (v0.1.0, listener up)') == registrations
+    assert lines.count('listener up on') == registrations and lines.count('registered (v0.2.0, listener up)') == registrations
     boot = docker('logs', name)
     assert boot.count('[bh-start] seeded ') == 1
     assert boot.count('[stage2] Setup complete; starting user services') == 1

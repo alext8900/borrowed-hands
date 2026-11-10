@@ -5,7 +5,9 @@ Hermes, and the Mac decides what may run. The Mac helper and build sandbox are i
 placeholder: its handler is a stub and this helper has no screen-capture executor.
 
 Tools: `hands_find`, `hands_system_info`, `hands_xcode_build`, `hands_job`, `hands_screen_capture`.
-Command: `/hands pair | status | unpair <name or id>` (owner only; `pair` only in a direct message).
+Command: `/hands pair | status | doctor | unpair <name or id>` (owner only; `pair` only in a direct message), and
+`/hands whoami`, which in a direct message tells any sender their own `platform:user_id` and changes nothing.
+Skill: `borrowed-hands:xcode-build-pr` (read-only).
 
 `hands_xcode_build` takes every argument as optional, so "Build my demo project on my Mac" is enough. The Mac,
 workspace, scheme, configuration and destination default from the Mac's grant when it allows one choice
@@ -13,17 +15,51 @@ workspace, scheme, configuration and destination default from the Mac's grant wh
 grant: the Mac shares only a fingerprint, so the first build names the URL once. With no `commit`, the plugin
 reads the granted repository's branch list and builds the tip of its only `bh/*` branch, or of the `bh/<name>`
 given as `branch`. Several `bh/*` branches, or several granted values, return `needs_input` with the options
-instead of guessing. The commit is resolved before the approval prompt: the prompt shows the first 7 characters of
-the SHA that the signed contract binds in full, for example "Build demo (scheme Demo, Debug, macOS arm64) at commit
-3449717 (latest on bh/fixed) on Macbook Pro M5 Max". A value that is not a plain granted-style name appears quoted
-and shortened, with control characters and markup removed, so it cannot pass for another part of the prompt. The
+instead of guessing. The commit is resolved before the approval prompt: the prompt shows the first 10 characters
+of the SHA that the signed contract binds in full, for example "Build at commit 3449717404 (latest on bh/fixed) on
+Macbook Pro M5 Max. Allow Once: this build only. ... Settings: demo (scheme Demo, Debug, macOS arm64)". Those 10
+characters catch mistakes; they are not proof against someone who can push to the branch shown and craft a commit
+with the same prefix. The branch on the card, protecting people's `bh/*` branches and Allow Once bound that. A
+commit that is not 40 lowercase hex, or a branch git would refuse, gets no approval prompt. A value that is not a
+plain granted-style name appears quoted and shortened, with control characters and markup removed, so it cannot pass for another part of the prompt. The
 Mac still checks its grants, its own remote and `bh/*` ancestry on every request. Hermes frames that reason with
 its own fixed label for plugin approval rules, which the plugin cannot change.
 
 Approval scope: a "session" or "always" answer covers the same Mac, workspace, scheme, configuration and
 destination, never a broader one. It does not name the commit or the branch, so after such an answer a build of a
 newer commit, or of the tip of a different `bh/*` branch of that granted repository, runs without a new prompt.
-Answer "once" to approve each build separately.
+Answer "once" to approve each build separately. A build's approval reason normally says so in a fixed sentence right
+after the commit and the Mac and before the other settings, because Hermes shortens long reasons from the end (not
+the fail-safe reason shown after an internal hook error, whose approval never covers a later build). "Always" is stored for the whole Hermes
+deployment, so it covers every chat on it.
+
+GitHub operations use Hermes's existing Git tooling and a repository-scoped credential. Borrowed Hands handles Mac discovery, locally authorized Xcode execution, and structured build results.
+
+Build results and the `hands_job` views of build jobs carry `provenance`: the commit the signed job builds, the `bh/*` branch the
+call named (if any) and how the commit was chosen (`latest on <branch>`, `explicit commit`, or `explicit commit;
+branch not checked`). When the agent edits and pushes a repository itself, it passes its own `bh/*` branch or
+pushed SHA, compares `provenance.commit` with what it pushed, and opens any pull request with Hermes's own Git or
+GitHub tools: this plugin never pushes, opens pull requests or touches GitHub credentials. See
+[Hermes edits, the Mac compiles](../docs/AUTONOMOUS.md).
+
+PR readiness: `hands_job` with `check_pr_ready: true` (status or wait) returns `pr_ready` first, with only
+plugin-written job fields beside it (the Mac's `result` and `error` text is left out). `pr_ready` is a verdict the plugin
+computes at that moment. `ready` is true only if the job is a build in state `succeeded` with a succeeded result,
+its provenance names a branch, and the plugin's own fresh read of the granted repository's branch list shows that
+branch's tip equal to the commit the signed contract binds. Otherwise `ready` is false with a `reason`:
+`build_not_succeeded` (with `state`), `superseded` (a newer build of the same commit, workspace and repository
+finished without success, so this older success is stale; `superseded_by` names it), `no_branch`, `branch_moved` (with the `tip` found), `branch_missing`,
+`refs_unavailable` (with `refs_reason`), `repo_not_granted`, `grant_disallows_build` (the grant no longer allows
+the scheme, configuration or destination built), `repo_url_unknown`, `no_provenance`, `not_a_build` or
+`check_failed`; any error is "not ready". A ready verdict rests on the job's Mac reporting success: the result
+carries no proof of which commit was compiled, and the plugin itself verifies only the branch tip. Grants are the
+ones the Mac last advertised, so an offline Mac's last caps count. The job, grant and URL checks run again after the read and must give the
+same result, including the grant's allowed values and expiry, so a grant revoked, expired or replaced while the
+read was in flight is "not ready"; a grant revoked and re-added unchanged in between cannot be seen, because caps
+carry no grant generation. The verdict names the `commit`, `branch`, `tip`, `repo_url` (normalized and
+percent-encoded), `checked_at` and (when ready) `confirmed_at`, is never
+stored, and holds only for that moment: the branch can move afterwards, and the plugin cannot see pull requests, so
+the agent opens the pull request from that branch and then checks that its head SHA equals `commit`.
 
 ## Disclosures (rule 13)
 
@@ -40,20 +76,26 @@ What this plugin does inside Hermes:
 - **Stored credentials and data.** In this plugin's directory under `$HERMES_HOME/plugin-data/`: a generated
   Ed25519 server private key (`server_ed25519.key`, mode 0600) and its lock file, and a SQLite database
   (`bh.sqlite3`, mode 0600) holding paired Macs' public keys, pairing-code hashes (never the codes), signed job
-  contracts, job results including compiler diagnostics, owner notices, an audit log, and the public repository
-  URL last named for each granted workspace. The gateway process can read these files, so any route the agent has
-  to the gateway's files reaches them: a shell or file tool on the local terminal backend, and a chat reply. In
-  Hermes's default media mode, a reply with a `MEDIA:<path>` tag makes the gateway attach that file to the chat;
-  for the key, a reply that just names its absolute path is enough. Hermes's media, file-read and
-  dangerous-command checks do not cover `plugin-data`. Set `HERMES_MEDIA_DELIVERY_STRICT=1` on the gateway (see
-  [residual risks](#limits-and-residual-risks)).
+  contracts, job results including compiler diagnostics, owner notices, an audit log, the public repository
+  URL last named for each granted workspace, and for each build the `bh/*` branch the call named and how its
+  commit was chosen. The gateway process can read these files, so any route the agent has to the gateway's files
+  reaches them: a shell or file tool on the local terminal backend, and a chat reply. In Hermes's default media
+  mode, a reply with a `MEDIA:<path>` tag makes the gateway attach that file to the chat; for the key, a reply
+  that just names its absolute path is enough. Hermes's media, file-read and dangerous-command checks do not cover
+  `plugin-data`. Set `HERMES_MEDIA_DELIVERY_STRICT=1` on the gateway (see
+  [residual risks](#limits-and-residual-risks)). An agent that also holds a Git push credential could publish the
+  key as well ([Hermes edits, the Mac compiles](../docs/AUTONOMOUS.md#the-agents-shell-can-read-the-borrowed-hands-key)).
 - **Reads outside its own data.** Its own settings from Hermes config, and the non-secret environment fallbacks
   `BH_LISTEN`, `BH_PORT`, `BH_PUBLIC_URL`, `RAILWAY_PUBLIC_DOMAIN`, `BH_OWNERS` and `BH_TRUSTED_PROXY`. It reads no
   secrets: no API keys, `.env` files, Hermes `auth.json`, keychains or other tools' logins.
-- **Network calls.** One outbound call of its own: when a build request names no commit, the Hermes server
-  contacts the host of the granted public repository (for example github.com) over HTTPS to read its branch list,
-  the same anonymous `GET <repo>/info/refs?service=git-upload-pack` request `git ls-remote` makes. It only reads
-  a repository whose fingerprint matches a grant the Mac advertised. The host must be a DNS name (IP-address and
+- **Network calls.** One kind of outbound call of its own: the Hermes server contacts the host of the granted
+  public repository (for example github.com) over HTTPS to read its branch list, the same anonymous
+  `GET <repo>/info/refs?service=git-upload-pack` request `git ls-remote` makes. It happens on two occasions only:
+  when a build request names no commit (before the approval prompt), and when `hands_job` is called with
+  `check_pr_ready: true` (one read per call, for that build's repository: the URL remembered for the fingerprint in
+  the job's signed contract, never a URL from the call). It only reads a repository whose fingerprint matches a
+  grant the Mac advertised (for the readiness check, an unexpired grant of the job's workspace in the caps the
+  job's own paired Mac last advertised). The host must be a DNS name (IP-address and
   single-label hosts are refused; a Unicode name is used as its IDNA A-label only when that conversion is
   lossless). The name is resolved once, every returned address must be public (loopback, private, link-local,
   site-local, CGNAT, multicast, reserved and unspecified addresses, and IPv6 forms that embed one, are refused),
@@ -63,10 +105,20 @@ What this plugin does inside Hermes:
   the connection is shut down and no request is sent after it. A lookup stuck inside the operating system's DNS
   resolver cannot be cancelled: it keeps one background thread until the resolver gives up, at most 4 such
   lookups are outstanding, and further reads are refused until one returns. Builds with an explicit commit make
-  no outbound call. Otherwise it sends build and system-info requests only to Macs you paired, over
+  no outbound call, and `hands_job` makes none unless `check_pr_ready` is true. Otherwise it sends build and system-info requests only to Macs you paired, over
   connections those Macs open, and makes no other third-party calls. Chat replies go through Hermes's configured
   messaging adapter. Hermes itself still uses your configured model and chat services.
 - **Shell commands.** None. The plugin starts no processes.
+- **Bundled script the agent runs.** The system prompt section tells the agent to run the bundled,
+  standard-library-only `templates/new_swiftui_app.py` with its own shell tool to write a new Xcode project
+  into its working directory. The script starts no process, makes no network call, overwrites and deletes
+  nothing, and prints a `bh grant add` command that only the Mac's owner can run.
+- **Bundled skill.** The plugin registers one read-only skill, `borrowed-hands:xcode-build-pr`
+  (`skills/xcode-build-pr/SKILL.md`), listed among the agent's available skills while the plugin is enabled. It
+  is text only: the order to call the tools in for a plain build, for edit, build, fix and pull request, and
+  for a new app, with the same rules as the system prompt section. It names no credential, path or variable of
+  any deployment, and Hermes does not copy it into your skills folder or let the agent edit it. A Hermes without
+  `register_skill` runs the plugin without it.
 - **Hooks.** A `pre_tool_call` hook asks for Hermes approval before `hands_xcode_build` and
   `hands_screen_capture`; for a build with no commit it first reads the branch list (see Network calls). A
   `post_tool_call` hook discards the approval record of any call that did not complete normally (blocked,
@@ -106,6 +158,10 @@ What the separate Mac install does. It is not loaded by Hermes; its source is in
 - **Stored credentials.** The helper stores its device Ed25519 private key, pairing, grants and job state under
   `~/Library/Application Support/BorrowedHands`, and logs under `~/Library/Logs/BorrowedHands`.
 - **Screen Recording.** Not requested. Setup skips capture and does not ask for Screen Recording in this version.
+- **"Administer your computer" prompt.** Deleting the build user during `bh uninstall` can make macOS ask
+  whether your terminal app may "administer your computer"; the delete waits for the answer. Allow goes to that
+  terminal app, not to Borrowed Hands, and how long it lasts was not established. An unanswered prompt stays open
+  after the command ends and deletes the account whenever it is clicked (see the quickstart's Uninstall section).
 
 ### Listener limits
 
@@ -149,12 +205,12 @@ Code running as the Mac user can read its key and alter grants. The hosting edge
 disrupt service. Builds can read some host metadata. Diagnostics are untrusted compiler text; scrubbing is
 hygiene, not a security boundary.
 Recorded completed compiles reported `cleanup_ok=true` and `wipe_ok=false`, including an unlink-protected empty
-trustd directory; full persistent-state removal is not established. See [protocol residual risks](../docs/PROTOCOL.md#8-residual-risks-accepted-for-01).
-No independent security review of 0.1 has been completed; this README makes no review or release-approval claim.
+trustd directory; full persistent-state removal is not established. See [protocol residual risks](../docs/PROTOCOL.md#8-residual-risks-accepted-for-02).
+No independent security review of 0.2 has been completed; this README makes no review or release-approval claim.
 
 ### If the server key leaks
 
-`/hands rotate-key` is not available in 0.1. Re-pair instead:
+`/hands rotate-key` is not available in this version. Re-pair instead:
 
 1. Run `bh unpair` on every Mac, while the gateway still runs (`/hands status` lists them). A Mac that has not
    unpaired keeps trusting the leaked key.

@@ -67,9 +67,19 @@ def step_xcode(env: Env) -> None:
 
 
 def step_sandbox(env: Env) -> None:
-    if env.install_status().ok:
+    first = env.install_status()
+    if first.ok:
         env.say("[2/7] Build sandbox: already installed (production)")
+        # A 'bh uninstall' that did not finish can leave its prompt open; Allow on it deletes the build user, also
+        # under this restored install. Nothing here can see that prompt, so say it.
+        env.say("  If a 'bh uninstall' did not finish, macOS may still show its prompt asking whether your terminal "
+                "app may \"administer your computer\": do not click Allow while you keep this install; it would "
+                "delete the build user. Finish 'bh uninstall' first if you meant to remove it.")
         return
+    if first.problems == (capsmod.BUILDER_MISSING,):
+        # the sandbox is in place but its build user is gone (an uninstall's prompt answered late): installing over
+        # the old group, home and folders is not ours to do here; the uninstall checks and removes them first
+        raise SetupFailed(f"[2/7] Build sandbox: {capsmod.BUILDER_MISSING}")
     env.say("[2/7] Build sandbox")
     env.say(SUDO_GUIDANCE)
     _admin(env, ["bash", str(SANDBOX / "setup-bh-builder.sh")],
@@ -166,19 +176,27 @@ def ask_workspace(env: Env) -> Workspace:
 
 def step_capabilities(env: Env) -> None:
     env.say("[5/7] What Hermes may do on this Mac (everything is off until you say yes)")
-    cfg = config.load(env.home)
+    # Ask first, then apply the answers to what is on disk in one locked update (never hold the lock while
+    # waiting for a person). A grant added meanwhile under the same name is refused, never replaced.
+    has_grants = bool(config.load(env.home).workspaces)
+    caps, ws = [], None
     if _yes(env, "Let Hermes see basic facts about this Mac (macOS, Xcode version, chip, memory, free disk)?", True):
-        cfg = cfg.with_capability("system.info", True)
+        caps.append("system.info")
     if _yes(env, "Let Hermes build Xcode projects you choose, in the build sandbox?", True):
-        cfg = cfg.with_capability("xcode.build", True)
-        if not cfg.workspaces:
+        caps.append("xcode.build")
+        if not has_grants:
             env.say("  Which project? Hermes can only build commits on bh/* branches of this repo.")
-            cfg = cfg.with_workspace(ask_workspace(env))
-    config.save(env.home, cfg)
+            ws = ask_workspace(env)
+
+    def apply(cfg: config.Config) -> config.Config:
+        for a in caps:
+            cfg = cfg.with_capability(a, True)
+        return cfg if ws is None else cfg.with_workspace(ws)
+    config.update(env.home, apply)
     if "screen.capture" in env.get_executors():
         if _yes(env, "Let Hermes take a screenshot when you ask it to?", False):
             env.say(SCREEN_GUIDANCE.format(app="Terminal"))
-            config.save(env.home, config.load(env.home).with_capability("screen.capture", True))
+            config.update(env.home, lambda c: c.with_capability("screen.capture", True))
     else:
         env.say("  Screen capture is not available in this version; skipping.")
 

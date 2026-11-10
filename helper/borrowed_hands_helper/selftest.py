@@ -201,6 +201,14 @@ async def _build(env: Env, cfg: config.Config, wid: str) -> list[Check]:
                   "" if ok else "see the error above")]
 
 
+def install_fix(st) -> str:
+    """The fix line for the sandbox check: with the build user gone, setup refuses until uninstall has finished."""
+    if st.ok:
+        return ""
+    from .caps import BUILDER_MISSING
+    return "run 'bh uninstall', then 'bh setup'" if BUILDER_MISSING in st.problems else "run 'bh setup'"
+
+
 async def collect(env: Env, build: Optional[str] = None) -> list[Check]:
     checks = [_versions()]
     st, cfg = _storage(env)
@@ -218,7 +226,7 @@ async def collect(env: Env, build: Optional[str] = None) -> list[Check]:
         problem, fix = xcode_problem(env)
         checks.append(Check("Xcode", False, problem, fix))
     checks.append(Check("production build sandbox", p.install.ok, "root-owned, no TEST_MODE, no test profiles"
-                        if p.install.ok else "; ".join(p.install.problems), "" if p.install.ok else "run 'bh setup'"))
+                        if p.install.ok else "; ".join(p.install.problems), install_fix(p.install)))
     checks += _sudo_rule(env, cfg.policy if cfg is not None else config.Policy())
     if cfg is not None and cfg.server is not None and st.ok:
         checks.append(await _server(env, cfg))

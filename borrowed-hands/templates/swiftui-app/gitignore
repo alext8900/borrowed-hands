@@ -1,0 +1,13 @@
+# Xcode
+DerivedData/
+build/
+xcuserdata/
+*.xcuserstate
+*.xcresult
+
+# Swift Package Manager (Borrowed Hands builds refuse remote packages; vendor any as local packages)
+.swiftpm/
+.build/
+
+# macOS
+.DS_Store

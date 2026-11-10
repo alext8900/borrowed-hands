@@ -6,9 +6,14 @@ a `Config`. Pairing grants nothing: `Config.empty` has every capability off and 
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import os
 import re
+import stat
 import subprocess
+import threading
+import time
 import tomllib
 import unicodedata
 from dataclasses import dataclass, field, replace
@@ -20,6 +25,8 @@ from . import keyfile
 from ._shared import bhproto
 
 CONFIG_NAME = "config.toml"
+LOCK_NAME = "config.lock"      # flock target; never config.toml itself, which is replaced by rename
+LOCK_TIMEOUT_S = 10.0
 DEFAULT_DIR = Path.home() / "Library" / "Application Support" / "BorrowedHands"
 
 # The frozen NAME pattern (pair.json device_name, caps.json name, schemes, configurations).
@@ -35,6 +42,15 @@ MAX_MEM_MB = 64 * 1024        # bh-runner MAX_MEM_BUDGET_MB
 
 class ConfigError(ValueError):
     pass
+
+
+class GrantExists(ConfigError):
+    """A different grant already uses this workspace id. Never silently broaden a grant: the caller shows
+    `existing` and the owner picks another name, revokes it first, or replaces it explicitly."""
+
+    def __init__(self, existing: "Workspace"):
+        super().__init__(f"a grant named {existing.id!r} already exists")
+        self.existing = existing
 
 
 def sanitize_device_name(raw: str) -> str:
@@ -125,8 +141,15 @@ class Config:
     def workspace(self, wid: str) -> Optional[Workspace]:
         return next((w for w in self.workspaces if w.id == wid), None)
 
-    def with_workspace(self, ws: Workspace) -> "Config":
+    def with_workspace(self, ws: Workspace, *, replace_existing: bool = False) -> "Config":
+        """Add a grant. Re-adding an identical grant (every field equal after validation) returns this same
+        Config. A different grant with the same id raises GrantExists unless replace_existing."""
         ws = validate_workspace(ws)
+        old = self.workspace(ws.id)
+        if old == ws:
+            return self
+        if old is not None and not replace_existing:
+            raise GrantExists(old)
         return replace(self, workspaces=tuple(w for w in self.workspaces if w.id != ws.id) + (ws,))
 
     def without_workspace(self, wid: str) -> "Config":
@@ -178,7 +201,44 @@ def validate_workspace(ws: Workspace) -> Workspace:
         raise ConfigError("confirm must be true or false")
     if ws.expires_at is not None and (type(ws.expires_at) is not int or ws.expires_at < 0):
         raise ConfigError("expires_at must be a time")
-    return replace(ws, schemes=schemes, configurations=configs, destinations=tuple(dict.fromkeys(ws.destinations)))
+    # config.toml stores whole seconds: keep only those from here on, so what is compared is what is saved
+    expires = None if ws.expires_at is None else ws.expires_at - ws.expires_at % 1000
+    return replace(ws, schemes=schemes, configurations=configs, destinations=tuple(dict.fromkeys(ws.destinations)),
+                   expires_at=expires)
+
+
+def grant_changes(old: Workspace, new: Workspace, when=None) -> list[tuple[str, bool]]:
+    """What replacing `old` with `new` changes: (sentence, more_permissive) per change, in field order.
+    `when` formats a unix-ms time."""
+    when = when or _ms_rfc3339
+    out: list[tuple[str, bool]] = []
+    if new.remote_url != old.remote_url:
+        out.append((f"repo: {old.remote_url} -> {new.remote_url} (a different repository)", True))
+    if new.project != old.project:
+        out.append((f"project: {old.project} -> {new.project}", True))
+    for label, a, b in (("scheme", old.schemes, new.schemes), ("configuration", old.configurations,
+                                                                new.configurations),
+                        ("destination", old.destinations, new.destinations)):
+        added = [x for x in b if x not in a]
+        removed = [x for x in a if x not in b]
+        if added:
+            out.append((f"{label}s added: {', '.join(added)}", True))
+        if removed:
+            out.append((f"{label}s removed: {', '.join(removed)}", False))
+        if not added and not removed and a != b:
+            out.append((f"{label} order: {', '.join(a)} -> {', '.join(b)}", False))
+    if old.confirm != new.confirm:
+        out.append((f"confirmation before every build turned {'on' if new.confirm else 'off'}", old.confirm))
+    if old.expires_at != new.expires_at:
+        if new.expires_at is None:
+            out.append((f"expiry removed (was {when(old.expires_at)})", True))
+        elif old.expires_at is None:
+            out.append((f"expiry added: {when(new.expires_at)}", False))
+        elif new.expires_at > old.expires_at:
+            out.append((f"expiry extended: {when(old.expires_at)} -> {when(new.expires_at)}", True))
+        else:
+            out.append((f"expiry shortened: {when(old.expires_at)} -> {when(new.expires_at)}", False))
+    return out
 
 
 def parse_expires(text: str, now_ms: int) -> int:
@@ -202,6 +262,9 @@ def _rfc3339_ms(text: str) -> int:
 
 def _ms_rfc3339(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+ms_rfc3339 = _ms_rfc3339       # UTC, whole seconds, trailing Z: the stored form
 
 
 # ---------------------------------------------------------------- TOML in and out
@@ -334,10 +397,88 @@ def load(d: Path = DEFAULT_DIR) -> Config:
     return parse(text)
 
 
-def save(d: Path, cfg: Config) -> None:
+class ConfigBusy(ConfigError):
+    pass
+
+
+_held = threading.local()
+
+
+def _key(d: Path) -> str:
+    return os.path.realpath(d)
+
+
+def lock_held(d: Path = DEFAULT_DIR) -> bool:
+    """True while this thread holds the config lock for `d`."""
+    return _key(d) in getattr(_held, "dirs", set())
+
+
+@contextlib.contextmanager
+def locked(d: Path = DEFAULT_DIR):
+    """The one exclusive lock for changing config.toml: flock on config.lock (0600, in the 0700 config dir).
+    Waits up to LOCK_TIMEOUT_S, then raises ConfigBusy; never proceeds without the lock. Not reentrant."""
+    d = Path(d)
+    keyfile.check_private_dir(d)
+    try:
+        fd = os.open(d / LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as e:
+        raise ConfigError(f"cannot open {LOCK_NAME} in {d} ({e.strerror}); nothing was changed") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            raise ConfigError(f"{d / LOCK_NAME} is not a regular file owned by you; remove it and retry")
+        if stat.S_IMODE(st.st_mode) != 0o600:
+            os.fchmod(fd, 0o600)
+        deadline = time.monotonic() + LOCK_TIMEOUT_S
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise ConfigBusy(f"another 'bh' command or the helper is changing config.toml and did not "
+                                     f"finish within {LOCK_TIMEOUT_S:g} s; nothing was changed. Try again; if "
+                                     f"this keeps happening, look for a stuck 'bh' process") from None
+                time.sleep(0.05)
+            except OSError as e:
+                raise ConfigError(f"cannot lock {d / LOCK_NAME} ({e.strerror}); nothing was changed") from None
+        dirs = getattr(_held, "dirs", None)
+        if dirs is None:
+            dirs = _held.dirs = set()
+        dirs.add(_key(d))
+        try:
+            yield
+        finally:
+            dirs.discard(_key(d))
+    finally:
+        os.close(fd)        # releases the flock
+
+
+def _write(d: Path, cfg: Config) -> None:
+    if not lock_held(d):
+        raise RuntimeError("config.toml written without the config lock")
     text = dump(cfg)
     parse(text)       # never write a file we could not read back
     keyfile.write_private_file(Path(d) / CONFIG_NAME, text.encode("utf-8"))
+
+
+def update(d: Path, change) -> Config:
+    """The way to change config.toml: under the lock, load what is on disk now, apply `change(cfg) -> Config`,
+    and write the result unless `change` returned the same object. Returns the resulting Config. Errors raised
+    by `change` leave the file untouched."""
+    with locked(d):
+        cfg = load(d)
+        new = change(cfg)
+        if new is not cfg:
+            _write(d, new)
+        return new
+
+
+def save(d: Path, cfg: Config) -> None:
+    """Write a whole new Config under the lock without reading the old one: only for starting fresh (pairing)
+    and tests. Anything derived from a loaded Config goes through update()."""
+    with locked(d):
+        _write(d, cfg)
 
 
 def mtime(d: Path = DEFAULT_DIR) -> Optional[float]:

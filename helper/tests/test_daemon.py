@@ -663,7 +663,7 @@ def test_grant_that_expires_while_queued_is_cancelled_on_dequeue(tmp_path):
         srv = await FakeServer().start()
         try:
             home = await pair_home(tmp_path, srv)
-            config.save(home, config.load(home).with_workspace(H.workspace(expires_at=bhproto_now() + 2000)))
+            config.save(home, config.load(home).with_workspace(H.workspace(expires_at=bhproto_now() + 2000), replace_existing=True))
             fb = FakeBuild()
             task = await start(home, srv, deps(fb))
             a, ra, sa = build_contract(srv)

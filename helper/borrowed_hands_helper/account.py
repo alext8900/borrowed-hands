@@ -25,6 +25,11 @@ ACK_TIMEOUT_S = 5.0
 ROTATE_TIMEOUT_S = 10.0
 
 
+def TELL_SERVER_S(timing: Timing) -> float:
+    """The longest `bh unpair` waits on the server before it deletes locally: each bounded step, and a margin."""
+    return timing.connect_s + timing.handshake_s + ACK_TIMEOUT_S + timing.close_s + 2.0
+
+
 def _host_of(url: str) -> str:
     try:
         return urlsplit(url).hostname or url
@@ -141,27 +146,49 @@ async def _one_shot(home: Path, connect, timing: Timing):
     return cfg, priv, session, t
 
 
-async def unpair(home: Path, *, connect=AiohttpTransport.connect, timing: Timing = Timing(), out=print) -> int:
-    """PROTOCOL 3.5 from the Mac: tell the server if we can (5 s), then always delete local state."""
+async def unpair(home: Path, *, connect=AiohttpTransport.connect, timing: Timing = Timing(), out=print,
+                 helper_stopped=lambda wait: True, stop_hint: str = "") -> int:
+    """PROTOCOL 3.5 from the Mac: tell the server if we can (5 s), then always delete local state.
+
+    `helper_stopped(wait)`: True only when no helper process is alive (the caller checks the helper lock; with
+    `wait` it may wait for one that is stopping). A live helper keeps the key, pin and grants in memory whatever
+    is deleted on disk, so without that this never says the pairing is deleted and returns 1."""
     told = False
-    try:
+
+    async def tell() -> bool:
         cfg, _, session, t = await _one_shot(home, connect, timing)
         try:
             text, fid = session.encode("unpair", {})
             await t.send(text)
-            told = await _await_reply(session, t, fid, ACK_TIMEOUT_S) == "ack"
+            return await _await_reply(session, t, fid, ACK_TIMEOUT_S) == "ack"
         finally:
             await t.close(1000)
+    try:
+        # One deadline over everything that waits on the server, so the deletion below never depends on it
+        told = await asyncio.wait_for(tell(), TELL_SERVER_S(timing))
     except (Stop, ConnectFailed, Closed, bhproto.ProtocolError, asyncio.TimeoutError, OSError,
             keyfile.UnsafeKeyStorage, config.ConfigError) as e:
         out(f"could not reach the server ({e}); removing this Mac's pairing locally anyway")
+    alive = (" But a helper is still running on this Mac, or could not be checked, and it holds the key, pin and "
+             "grants in memory until it stops, so it can still connect and build. Stop it (Ctrl-C for 'bh run'"
+             + (f"; {stop_hint}" if stop_hint else "") + "), then run 'bh unpair' again to confirm.")
     keyfile.delete_device_key(home)
     _delete_jobs_db(home)
     try:
-        cfg = config.load(home)
-        config.save(home, replace(cfg, server=None, capabilities=config.Capabilities(), workspaces=()))
-    except (config.ConfigError, keyfile.UnsafeKeyStorage):
-        pass
+        config.update(home, lambda cfg: replace(cfg, server=None, capabilities=config.Capabilities(), workspaces=()))
+    except (config.ConfigError, keyfile.UnsafeKeyStorage, OSError) as e:
+        # Busy, unusable lock (symlink, wrong owner, unopenable), damaged or unreadable config.toml, unsafe
+        # folder, or any other OS error from the config transaction: say what
+        # was and was not removed; never claim the pins and grants are gone.
+        out(f"The device key and job history are deleted, but the server pin and grants in config.toml could not "
+            f"be cleared: {e}. Fix that, then run 'bh unpair' again."
+            + ("" if helper_stopped(False) else alive)
+            + ("" if told else " The server was not told; remove the stale entry there with /hands unpair."))
+        return 1
+    if not helper_stopped(True):
+        out("The device key, server pins, grants and job history are deleted from disk." + alive
+            + ("" if told else " The server was not told; remove the stale entry there with /hands unpair."))
+        return 1
     out("Unpaired: the device key, server pins, grants and job history on this Mac are deleted."
         + ("" if told else " The server was not told; remove the stale entry there with /hands unpair."))
     return 0

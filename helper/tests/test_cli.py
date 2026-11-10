@@ -185,6 +185,163 @@ def test_grant_add_refuses_bad_input_with_exit_2(tmp_path, args, needle):
     assert needle in w.text() and config.load(w.env.home).workspaces == ()
 
 
+GRANT = ["grant", "add", "xcode.build", "--workspace", "demo", "--repo", H.REMOTE, "--project", "Demo.xcodeproj",
+         "--scheme", "Demo", "--confirm", "--expires", "2030-01-01T00:00:00Z"]
+GRANT_LINE = (f"demo: {H.REMOTE} Demo.xcodeproj; schemes Demo; configurations Debug; destinations "
+              f"platform=macOS,arch=arm64; confirm on; expires 2030-01-01T00:00:00Z")   # UTC, seconds
+
+
+def _cfg_bytes(w):
+    return (w.env.home / config.CONFIG_NAME).read_bytes()
+
+
+def _advertised(w):
+    probes = caps.Probes(install=InstallStatus(True, ()), sudo_ok=True, xcode=("26.1", "17B55"),
+                         screen_granted=False)
+    return caps.caps_body(config.load(w.env.home), probes, busy=False, queue_depth=0, host=Host("26.2", "arm64"))
+
+
+def _granted(tmp_path):
+    w = World(tmp_path)
+    paired(w)
+    config.save(w.env.home, config.load(w.env.home).with_capability("xcode.build", True))
+    assert bh(w, *GRANT) == 0, w.text()
+    w.out.clear(), w.errs.clear()
+    return w
+
+
+def test_grant_add_refuses_an_existing_name_and_changes_nothing(tmp_path):
+    w = _granted(tmp_path)
+    before, body, mtime = _cfg_bytes(w), _advertised(w), config.mtime(w.env.home)
+    rc = bh(w, "grant", "add", "xcode.build", "--workspace", "demo", "--repo", "https://github.com/a/other",
+            "--project", "Other.xcodeproj", "--scheme", "Other", "--destination", "generic/platform=iOS Simulator")
+    assert rc == 2
+    assert _cfg_bytes(w) == before and config.mtime(w.env.home) == mtime and _advertised(w) == body
+    assert w.out == [] and w.errs == [
+        "a grant named 'demo' already exists; nothing was changed. It allows:",
+        f"  {GRANT_LINE}",
+        "To add a separate grant, pick another --workspace name. To change this one, rerun the command with "
+        "--replace (it prints what changes), or run 'bh grant revoke demo' first."]
+
+
+def test_grant_add_refuses_a_narrower_grant_too(tmp_path):
+    w = _granted(tmp_path)
+    before = _cfg_bytes(w)
+    assert bh(w, *GRANT[:-2], "--expires", "2029-01-01T00:00:00Z") == 2 and _cfg_bytes(w) == before
+    # a repeated --scheme collapses in validation, so this is the same grant
+    assert bh(w, *GRANT, "--scheme", "Demo") == 0 and _cfg_bytes(w) == before
+
+
+def test_grant_add_identical_is_quiet_and_writes_nothing(tmp_path):
+    w = _granted(tmp_path)
+    before, body, mtime = _cfg_bytes(w), _advertised(w), config.mtime(w.env.home)
+    assert bh(w, *GRANT) == 0
+    assert bh(w, *GRANT, "--replace") == 0
+    assert _cfg_bytes(w) == before and config.mtime(w.env.home) == mtime and _advertised(w) == body
+    assert w.errs == [] and w.out == ["Grant demo already exists with exactly these settings; nothing changed."] * 2
+
+
+def test_grant_add_replace_prints_before_after_and_flags_widening(tmp_path):
+    w = _granted(tmp_path)
+    body = _advertised(w)
+    rc = bh(w, "grant", "add", "xcode.build", "--workspace", "demo", "--repo", "https://github.com/a/other",
+            "--project", "Demo.xcodeproj", "--scheme", "Demo", "--scheme", "Tests", "--destination",
+            "platform=macOS,arch=arm64", "--destination", "generic/platform=iOS Simulator", "--replace")
+    assert rc == 0, w.text()
+    ws = config.load(w.env.home).workspace("demo")
+    assert ws.remote_url == "https://github.com/a/other" and ws.schemes == ("Demo", "Tests")
+    assert not ws.confirm and ws.expires_at is None and len(config.load(w.env.home).workspaces) == 1
+    after = (f"demo: https://github.com/a/other Demo.xcodeproj; schemes Demo, Tests; configurations Debug; "
+             f"destinations platform=macOS,arch=arm64 | generic/platform=iOS Simulator; confirm off; expires never")
+    assert w.errs == [] and w.out == [
+        "Replaced grant demo.",
+        f"  before: {GRANT_LINE}",
+        f"  after:  {after}",
+        f"  MORE PERMISSIVE: repo: {H.REMOTE} -> https://github.com/a/other (a different repository)",
+        "  MORE PERMISSIVE: schemes added: Tests",
+        "  MORE PERMISSIVE: destinations added: generic/platform=iOS Simulator",
+        "  MORE PERMISSIVE: confirmation before every build turned off",
+        "  MORE PERMISSIVE: expiry removed (was 2030-01-01T00:00:00Z)",
+        "Hermes can build commits on bh/* branches of that repo."]
+    new = _advertised(w)
+    assert new != body
+    [xb] = [c for c in new["capabilities"] if c["name"] == "xcode.build"]
+    assert xb["workspaces"][0]["repo_fingerprint"] == bhproto.repo_fingerprint("https://github.com/a/other")
+
+
+def test_grant_add_replace_narrowing_is_not_called_more_permissive(tmp_path):
+    w = _granted(tmp_path)
+    assert bh(w, *GRANT[:-2], "--expires", "2029-01-01T00:00:00Z", "--replace") == 0, w.text()
+    assert "MORE PERMISSIVE" not in w.text()
+    assert "  changed: expiry shortened: 2030-01-01T00:00:00Z -> 2029-01-01T00:00:00Z" in w.out
+    assert config.load(w.env.home).workspace("demo").expires_at == 1861920000000
+
+
+def test_grant_add_replace_without_an_existing_grant_just_adds(tmp_path):
+    w = World(tmp_path)
+    paired(w)
+    assert bh(w, *GRANT, "--replace") == 0 and config.load(w.env.home).workspace("demo").confirm
+    assert "Replaced" not in w.text() and w.out[0].startswith("Granted xcode.build for demo.")
+
+
+def test_grant_add_relative_expiry_matches_only_the_same_instant(tmp_path, monkeypatch):
+    # `--expires 7d` resolves against the clock: the same instant is the same grant (nothing changes); a later
+    # instant would extend the grant, so it is refused without --replace.
+    now = [1_800_000_000_000]
+    monkeypatch.setattr(cli, "_now_ms", lambda: now[0])
+    w = World(tmp_path)
+    paired(w)
+    args = GRANT[:-1] + ["7d"]
+    assert bh(w, *args) == 0
+    before = _cfg_bytes(w)
+    w.out.clear(), w.errs.clear()
+    assert bh(w, *args) == 0 and _cfg_bytes(w) == before
+    assert w.out == ["Grant demo already exists with exactly these settings; nothing changed."]
+    now[0] += 1000
+    assert bh(w, *args) == 2 and _cfg_bytes(w) == before and "already exists" in w.errs[0]
+
+
+def test_grant_add_fractional_expiry_is_kept_to_whole_seconds_and_re_adds_quietly(tmp_path):
+    w = World(tmp_path)
+    paired(w)
+    args = GRANT[:-1] + ["2030-01-01T00:00:00.123Z"]
+    assert bh(w, *args) == 0, w.text()
+    assert config.load(w.env.home).workspace("demo").expires_at == 1893456000000
+    before = _cfg_bytes(w)
+    w.out.clear(), w.errs.clear()
+    assert bh(w, *args) == 0 and bh(w, *args, "--replace") == 0
+    assert _cfg_bytes(w) == before and w.errs == []
+    assert w.out == ["Grant demo already exists with exactly these settings; nothing changed."] * 2
+
+
+def test_grant_add_replace_shows_expiry_changes_within_a_minute(tmp_path):
+    w = World(tmp_path)
+    paired(w)
+    assert bh(w, *GRANT[:-1], "2030-01-01T00:00:01Z") == 0
+    w.out.clear()
+    assert bh(w, *GRANT[:-1], "2030-01-01T00:00:59Z", "--replace") == 0
+    assert "  MORE PERMISSIVE: expiry extended: 2030-01-01T00:00:01Z -> 2030-01-01T00:00:59Z" in w.out
+    assert any(x.startswith("  before: ") and x.endswith("expires 2030-01-01T00:00:01Z") for x in w.out)
+    assert any(x.startswith("  after:  ") and x.endswith("expires 2030-01-01T00:00:59Z") for x in w.out)
+
+
+def test_grant_list_keeps_its_local_format(tmp_path):
+    w = _granted(tmp_path)
+    assert bh(w, "grant", "list") == 0
+    assert w.out == [f"demo: {H.REMOTE} Demo.xcodeproj; schemes Demo; configurations Debug; destinations "
+                     f"platform=macOS,arch=arm64; confirm on; expires {cli._ms(1893456000000)}"]
+
+
+def test_setup_never_replaces_an_existing_grant(tmp_path):
+    w = World(tmp_path, installed=True, sudo_rule=True, answers=["y", "y", "n"])
+    paired(w)
+    config.save(w.env.home, config.load(w.env.home).with_workspace(H.workspace(id="other", confirm=True)))
+    bh(w, "setup")
+    assert "[5/7]" in w.text()
+    assert config.load(w.env.home).workspaces == (H.workspace(id="other", confirm=True),)
+    assert "Short name for this project" not in w.text()
+
+
 def test_caps_enable_requires_production_install(tmp_path):
     w = World(tmp_path, test_mode=True)
     paired(w)
@@ -772,14 +929,15 @@ def _uninspected_world(tmp_path, user_before: bool, teardown_rc: int = 0):
     return w
 
 
-def test_folders_nobody_inspected_are_unknown_not_ok(tmp_path):
-    # Security review round 1 P2: bh-builder was already gone (hand dscl -delete, an older release), so no teardown looked inside
-    # T and C in this run; the admin user cannot either
-    w = _uninspected_world(tmp_path, user_before=False)
+def test_folders_the_teardown_checked_and_found_not_clean_are_a_dead_end_said_plainly(tmp_path):
+    # the account was already gone (a late Allow on an earlier run's prompt, or a hand delete): the teardown checks
+    # the folders read-only and exits 3 when they are not verifiably empty; nothing in bh uninstall can remove them
+    w = _uninspected_world(tmp_path, user_before=False, teardown_rc=3)
     rc = bh(w, "uninstall")
     line = next(l for l in w.out if "build user caches" in l)
     assert rc == 1 and line.startswith("  UNKNOWN "), line
     assert "left by macOS" not in line and "nothing removable" not in line, line
+    assert "verified by the teardown" not in w.text(), w.text()
     check = line.split("look with: ", 1)[1].split("; ", 1)[0]
     assert shlex.split(check) == ["sudo", "ls", "-laO", f"{SKEL}/C", f"{SKEL}/T"], line
     assert "Uninstalled and verified" not in w.text()
@@ -789,29 +947,53 @@ def test_folders_nobody_inspected_are_unknown_not_ok(tmp_path):
     footer = " ".join(w.errs)
     assert "will not change" in footer and "run 'bh uninstall' again" not in footer, footer
     assert "uv tool uninstall borrowed-hands-helper" in footer, footer
+    assert not any(l.startswith("  LEFT ") and "teardown" in l for l in w.out), w.out    # its other work is done
 
 
 def test_a_rerun_dead_end_does_not_hide_items_a_rerun_can_fix(tmp_path):
-    w = _uninspected_world(tmp_path, user_before=False)
+    w = _uninspected_world(tmp_path, user_before=False, teardown_rc=3)
     w.left.add("/opt/borrowed-hands")
     rc = bh(w, "uninstall")
     footer = " ".join(w.errs)
     assert rc == 1 and "run 'bh uninstall' again" in footer and "stay UNKNOWN" in footer, footer
 
 
-def test_folders_the_teardown_verified_in_this_run_are_ok(tmp_path):
-    w = _uninspected_world(tmp_path, user_before=True)
+@pytest.mark.parametrize("user_before", [True, False])
+def test_folders_the_teardown_verified_in_this_run_are_ok(tmp_path, user_before):
+    # Security review round 1 F2: the script vouches, not a snapshot: its exit 0 always means it checked them (also when the
+    # account was already gone when it started)
+    w = _uninspected_world(tmp_path, user_before=user_before)
     rc = bh(w, "uninstall")
     line = next(l for l in w.out if "build user caches" in l)
     assert rc == 0 and line.startswith("  ok ") and "left by macOS" in line, (line, w.text())
     assert "verified by the teardown in this run" in line, line
 
 
-def test_a_failed_teardown_does_not_vouch_for_the_folders(tmp_path):
-    w = _uninspected_world(tmp_path, user_before=True, teardown_rc=1)     # even if the account is gone afterwards
+@pytest.mark.parametrize("teardown_rc", [1, 2, 127])
+def test_a_failed_teardown_does_not_vouch_for_the_folders(tmp_path, teardown_rc):
+    w = _uninspected_world(tmp_path, user_before=True, teardown_rc=teardown_rc)   # even if the account is gone after
     rc = bh(w, "uninstall")
     line = next(l for l in w.out if "build user caches" in l)
     assert rc == 1 and line.startswith("  UNKNOWN "), line
+    assert "verified by the teardown" not in w.text() and "will not change" not in line, line   # a rerun can help
+    assert "did not verify them in this run" in line, line
+
+
+def test_a_teardown_that_did_not_run_does_not_vouch_for_the_folders(tmp_path):
+    # Security review round 2 N7 (P03): with the account gone the caches line reaches the decision that matters
+    w = _uninspected_world(tmp_path, user_before=False)
+    real = w.env.sudo
+
+    def sudo(argv):
+        if argv[:2] == ["/bin/rm", "-f"]:
+            w.sudo_calls.append(argv)
+            return 1
+        return real(argv)
+    w.env.sudo = sudo
+    rc = bh(w, "uninstall")
+    line = next(l for l in w.out if "build user caches" in l)
+    assert rc == 1 and TEARDOWN not in w.sudo_calls and "verified by the teardown" not in w.text(), line
+    assert line.startswith("  UNKNOWN ") and "did not verify them in this run" in line, line
 
 
 def test_checklist_recovery_text_matches_the_teardown():
@@ -1162,6 +1344,14 @@ def test_selftest_with_another_xcode_selected_passes_with_a_note(tmp_path):
     assert "/Applications/Xcode.app" in line and CLT in line, line
 
 
+def test_doctor_is_another_name_for_selftest(tmp_path):
+    a, b = World(tmp_path / "a", installed=True, sudo_rule=True), World(tmp_path / "b", installed=True, sudo_rule=True)
+    assert bh(a, "selftest") == bh(b, "doctor") == 1
+    assert a.text() == b.text() and "Self-test" in a.text()
+    rc, w = run_selftest(tmp_path / "paired", argv=("doctor",))
+    assert rc == 0 and "All checks passed." in w.text(), w.text()
+
+
 def test_selftest_on_a_never_set_up_mac_points_at_setup_not_re_pairing(tmp_path):
     w = World(tmp_path, installed=True, sudo_rule=True)
     assert not w.env.home.exists()
@@ -1198,3 +1388,138 @@ def test_selftest_build_needs_the_xcode_executor(tmp_path):
         w.env.executors = {"system.info": object()}
     rc, w = run_selftest(tmp_path, mutate=drop, argv=("selftest", "--build", "demo"))
     assert rc == 1 and "xcode.build" in w.text()
+
+
+def test_uninstall_announces_the_admin_prompt_before_the_teardown(tmp_path):
+    # macOS asks whether the app running this terminal may "administer your computer" when the build user is deleted
+    w = uninstall_world(tmp_path)
+    bh(w, "uninstall")
+    note = next(i for i, l in enumerate(w.out) if "administer your computer" in l)
+    run = next(i for i, l in enumerate(w.out) if l.startswith("  $ ") and "teardown-bh-builder.sh" in l)
+    assert note < run and "Allow" in w.out[note], w.out
+
+
+def test_setup_stops_when_the_dispatcher_is_left_without_its_build_user(tmp_path):
+    # Security review round 1 F3: after a late Allow, setup must not call the sandbox ready nor reinstall over the leftovers
+    from borrowed_hands_helper import caps as capsmod, setup
+    w = World(tmp_path)
+    w.env = cli.replace(w.env, install_status=lambda: InstallStatus(False, (capsmod.BUILDER_MISSING,)))
+    with pytest.raises(setup.SetupFailed) as e:
+        setup.step_sandbox(w.env)
+    assert "bh uninstall" in str(e.value) and "already installed" not in w.text(), (str(e.value), w.text())
+    assert w.sudo_calls == []
+
+
+def test_setup_installs_on_a_fresh_mac_without_a_build_user(tmp_path):
+    from borrowed_hands_helper import caps as capsmod, setup
+    w = World(tmp_path)
+    calls = iter([InstallStatus(False, ("/opt/borrowed-hands/bin/bh-dispatch is missing: run 'bh setup'",
+                                        capsmod.BUILDER_MISSING)), InstallStatus(True, ())])
+    w.env = cli.replace(w.env, install_status=lambda: next(calls))
+    setup.step_sandbox(w.env)
+    assert w.sudo_calls == [["bash", str(SANDBOX / "setup-bh-builder.sh")]], w.sudo_calls
+
+
+def test_the_uninstall_notice_says_a_late_answer_still_deletes_the_account(tmp_path):
+    w = uninstall_world(tmp_path)
+    bh(w, "uninstall")
+    note = next(l for l in w.out if "administer your computer" in l)
+    assert "after this command ends" in note, note
+
+
+def test_ctrl_c_during_the_teardown_prints_the_checklist_and_says_the_prompt_stays_armed(tmp_path):
+    # Security review round 1 F6: the wait can last ~10 minutes; Ctrl-C used to end in a Python traceback with no checklist
+    w = uninstall_world(tmp_path)
+    real = w._sudo
+
+    def sudo(argv):
+        if argv == TEARDOWN:
+            w.sudo_calls.append(argv)
+            raise KeyboardInterrupt
+        return real(argv)
+    w.env.sudo = sudo
+    rc = bh(w, "uninstall")                       # no exception escapes
+    text = w.text()
+    assert rc == 130 and "Removal check:" in text and "Uninstalled and verified" not in text, text
+    assert "still open" in text and "run 'bh uninstall' again first" in text, text
+    assert not w.env.home.exists(), "the helper's state directory was left behind"
+
+
+def test_sudo_is_waited_for_on_ctrl_c_never_killed(monkeypatch):
+    # Security review round 2 N2: subprocess.run kills its child 0.25 s after a KeyboardInterrupt; a sudo that already runs as root
+    # answers EPERM, and the PermissionError skips the Ctrl-C handler. Wait for sudo instead, then re-raise.
+    import subprocess
+    from borrowed_hands_helper import env as envmod
+    calls = []
+
+    class FakePopen:
+        def __init__(self, argv, *a, **kw):
+            calls.append(("start", argv))
+            self.waits = 0
+
+        def wait(self, timeout=None):
+            self.waits += 1
+            calls.append(("wait", self.waits))
+            if self.waits == 1:
+                raise KeyboardInterrupt
+            return 0
+
+        def kill(self):
+            calls.append(("kill",))
+            raise PermissionError(1, "Operation not permitted")
+
+        send_signal = terminate = kill
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+    with pytest.raises(KeyboardInterrupt):
+        envmod._sudo(["bash", "teardown-bh-builder.sh"])
+    assert calls == [("start", ["/usr/bin/sudo", "bash", "teardown-bh-builder.sh"]), ("wait", 1), ("wait", 2)], calls
+
+
+def test_setup_on_a_live_install_warns_about_a_possibly_open_prompt(tmp_path):
+    # Security review round 2 N4: after a failed uninstall the account still exists, so setup skips the installer (and its
+    # warning); an open prompt from that uninstall would delete the build user under the restored install
+    from borrowed_hands_helper import setup
+    w = World(tmp_path)
+    w.env = cli.replace(w.env, install_status=lambda: InstallStatus(True, ()))
+    setup.step_sandbox(w.env)
+    note = next(l for l in w.out if "administer your computer" in l)
+    assert "already installed" in w.text() and "do not click Allow" in note and "bh uninstall" in note, w.out
+    assert "detect" not in note, note                                  # code cannot see a pending prompt
+
+
+
+def test_ctrl_c_never_reports_the_folders_as_verified(tmp_path):
+    # Security review round 2 N7 (P08): an interrupted teardown vouches for nothing
+    w = _uninspected_world(tmp_path, user_before=False)
+
+    def sudo(argv):
+        if argv == TEARDOWN:
+            raise KeyboardInterrupt
+        return 0
+    w.env.sudo = sudo
+    rc = bh(w, "uninstall")
+    line = next(l for l in w.out if "build user caches" in l)
+    assert rc == 130 and line.startswith("  UNKNOWN ") and "verified by the teardown" not in w.text(), line
+
+
+
+def test_exit_3_is_not_announced_as_a_failed_command(tmp_path):
+    # Security review round 2 N8d: the checklist shows that step as done; do not say "that command failed" above it
+    w = _uninspected_world(tmp_path, user_before=False, teardown_rc=3)
+    bh(w, "uninstall")
+    assert "that command failed" not in w.text() and "could not verify uid 470's per-user folders" in w.text(), w.text()
+
+
+def test_the_uninstall_notice_names_the_user_or_its_group(tmp_path):
+    w = uninstall_world(tmp_path)
+    bh(w, "uninstall")
+    note = next(l for l in w.out if "administer your computer" in l)
+    assert "build user or its group" in note, note
+
+
+def test_selftest_fix_for_a_missing_build_user_says_uninstall_first():
+    from borrowed_hands_helper import caps as capsmod, selftest
+    assert selftest.install_fix(InstallStatus(False, (capsmod.BUILDER_MISSING,))) == \
+        "run 'bh uninstall', then 'bh setup'"
+    assert selftest.install_fix(InstallStatus(False, ("x is missing: run 'bh setup'",))) == "run 'bh setup'"
+    assert selftest.install_fix(InstallStatus(True, ())) == ""

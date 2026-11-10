@@ -16,6 +16,7 @@ from .store import Store
 
 log = logging.getLogger("borrowed_hands")
 TOOLSET = "borrowed_hands"
+SKILL = "xcode-build-pr"
 
 
 def _resolver(rt: runtime.Runtime):
@@ -62,6 +63,15 @@ def register(ctx) -> None:
     ctx.register_command("hands", commands.handle, description="Borrowed Hands: pair, status, unpair",
                          args_hint="pair|status|unpair <helper>")
     ctx.register_system_prompt_section("borrowed-hands", prompt.TEXT)
+    # Read-only skill with the build, edit-build-PR and new-app procedures. Optional: a host without
+    # register_skill, or a failure here, must not cost the tools.
+    if callable(getattr(ctx, "register_skill", None)):
+        try:
+            ctx.register_skill(SKILL, Path(__file__).parent / "skills" / SKILL / "SKILL.md",
+                               description="Build on a paired Mac with Borrowed Hands: plain build, "
+                                           "edit-build-fix-PR, new app.")
+        except Exception as exc:
+            log.warning("borrowed_hands: skill %s not registered (%s: %s)", SKILL, type(exc).__name__, exc)
 
     ok, rt.gate_reason = gate.should_listen(settings.listen_enabled, sys.argv, sys.modules)
     if not rt.degraded:
@@ -89,6 +99,6 @@ def register(ctx) -> None:
             runtime.RT = None
         hooks.TICKETS.clear()
     ctx.on_unload(_unload)
-    log.info("borrowed_hands: registered (v0.1.0, listener %s) in %.0f ms",
+    log.info("borrowed_hands: registered (v0.2.0, listener %s) in %.0f ms",
              "up" if rt.listener is not None and rt.listener.running else f"off: {rt.gate_reason}",
              (time.monotonic() - t0) * 1000)

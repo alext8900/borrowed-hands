@@ -17,7 +17,8 @@ repository.
 
 You need Hermes v0.22.7 or newer, a chat platform Hermes supports (the examples use Telegram), a model provider key,
 and a public HTTPS host name for the gateway. The gateway also needs outbound HTTPS to your Git host: it reads a
-granted repository's branch list (anonymously) to find the latest `bh/` commit when a request names none.
+granted repository's branch list (anonymously) to find the latest `bh/` commit when a request names none, and when
+the agent asks for a PR-readiness check of a build.
 
 ### Option A: Railway (recommended; this repository ships the template)
 
@@ -62,11 +63,16 @@ granted repository's branch list (anonymously) to find the latest `bh/` commit w
 
 ### Option B: an existing Hermes
 
-1. Install and enable the plugin at an exact commit:
+1. Install and enable the plugin from the Hermes plugin catalog, which pins an exact reviewed commit:
 
    ```sh
-   hermes plugins install alext8900/borrowed-hands#borrowed-hands --ref <40-character commit SHA> --enable
+   hermes plugins install borrowed-hands --enable
    ```
+
+   This guide describes version 0.2.0. `/hands doctor`, `/hands whoami`, the bundled skill, `check_pr_ready` and
+   the new-app template need it; `hermes plugins list` shows the version you have. If the catalog still installs
+   0.1.0, or does not list the plugin yet, install the same way from the repository at the commit tagged `v0.2.0`
+   (`git ls-remote https://github.com/alext8900/borrowed-hands v0.2.0` prints it): `hermes plugins install alext8900/borrowed-hands#borrowed-hands --ref <40-character commit SHA> --enable`.
 
 2. Add the settings to Hermes `config.yaml`:
 
@@ -80,15 +86,26 @@ granted repository's branch list (anonymously) to find the latest `bh/` commit w
            owners: ["telegram:123456789"]
    ```
 
+   The same three as environment variables, if you would rather not edit the file: `BH_LISTEN=1`,
+   `BH_PUBLIC_URL=wss://hermes.example.com/bh/v1/ws`, `BH_OWNERS=telegram:123456789`. For the `owners` value,
+   send the bot `/hands whoami` in a DM once the plugin is enabled: it prints your exact `platform:user_id`.
+
 3. Put a TLS reverse proxy in front: `https://hermes.example.com/bh/v1/` must reach `127.0.0.1:8790` with WebSocket
    upgrades allowed on `/bh/v1/ws`. The plugin itself speaks plain HTTP; `public_url` only tells Macs where to
-   connect, it does not create the endpoint.
+   connect, it does not create the endpoint. Without a server of your own, a tunnel does the same job. Neither
+   of these was tested for this guide; both carry WebSockets according to their own documentation:
+   - Tailscale Funnel: `tailscale funnel 8790`, then `public_url` is `wss://<machine>.<tailnet>.ts.net/bh/v1/ws`.
+   - Cloudflare Tunnel: `cloudflared tunnel --url http://127.0.0.1:8790` prints an `https://…trycloudflare.com`
+     address for a quick trial (it changes on every start; use a named tunnel to keep one), and `public_url`
+     is that host with `wss://` and `/bh/v1/ws`.
+   The plugin never starts a tunnel itself.
 4. Recommended: set `HERMES_MEDIA_DELIVERY_STRICT=1` in the gateway's environment (or `gateway: {strict: true}` in
    `config.yaml`). It blocks the server key only once the key is older than the configured recency window (600
    seconds by default) and while no allowed directory contains it. It gives the job database no confidentiality
    guarantee and does not limit the terminal and file tools. Option A has the exact conditions.
 5. Restart `hermes gateway run`. The listener only starts in the gateway process. Check
-   `curl https://hermes.example.com/bh/v1/healthz`.
+   `curl https://hermes.example.com/bh/v1/healthz`, then send the bot `/hands doctor`: it lists the listener, the
+   public URL, the owners and each paired Mac, with the fix next to anything that is wrong.
 
 More operator detail (all settings, logs, failure table): [operator reference](INSTALL.md).
 
@@ -98,14 +115,15 @@ You need an Apple silicon Mac, an admin account, [uv](https://docs.astral.sh/uv/
 Xcode installed at `/Applications/Xcode.app` and opened once. Builds always use that exact copy of Xcode, whatever
 `xcode-select` points at; if another copy or the Command Line Tools are selected, setup just notes it.
 
-1. **Install the helper** from a checkout of this repository:
+1. **Install the helper.** One command; uv fetches the tagged source, and the build sandbox's scripts come
+   inside the package:
 
    ```sh
-   git clone https://github.com/alext8900/borrowed-hands.git
-   cd borrowed-hands
-   uv tool install ./helper
+   uv tool install "git+https://github.com/alext8900/borrowed-hands@v0.2.0#subdirectory=helper"
    uv tool update-shell
    ```
+
+   From a checkout of this repository, `uv tool install ./helper` installs the same thing.
 
    Then **open a new terminal window** so `bh` is on your PATH (uv installs it in `~/.local/bin`). Check with
    `bh --version`.
@@ -149,9 +167,10 @@ Xcode installed at `/Applications/Xcode.app` and opened once. Builds always use 
 
    The first time, Hermes asks for the repository's URL once (`https://github.com/alext8900/borrowed-hands-demo.git`):
    the Mac shares only a fingerprint of it, and Hermes remembers the URL after that. Approve the build when Hermes
-   asks; the approval names the exact commit, for example `Build demo (scheme BorrowedHandsDemo, Debug, macOS arm64)
-   at commit 5f2eee7 (latest on bh/main) on <your Mac>`. You get the build state, duration, Xcode version, and any
-   errors and warnings with file, line and column. A failed compile is still a successful answer: read `state`
+   asks; the approval names the exact commit by its first 10 characters, for example `Build at commit <10 hex
+   characters> (latest on bh/main) on <your Mac>`, then what each answer covers, then `Settings: demo (scheme
+   BorrowedHandsDemo, Debug, macOS arm64)`. You get the build state, duration, Xcode version, and any errors and
+   warnings with file, line and column. A failed compile is still a successful answer: read `state`
    (`succeeded` or `failed`), not just `ok`.
 
    An explicit request with a full commit SHA always works too. Get the SHA with
@@ -162,9 +181,11 @@ Xcode installed at `/Applications/Xcode.app` and opened once. Builds always use 
 
 ### How Hermes fills in a build request
 
-The build tool's own description: "Every argument is optional: pass only what the user said ("build my demo project"
-needs none). Omitted values come from the Mac's grant when it allows exactly one choice, and an omitted commit is
-the latest commit on the repository's bh/* branch." In detail:
+The build tool's own description: "Every argument is optional ("build my demo project" needs none): pass what the
+user chose in this conversation, or what you did yourself in this task, such as a bh/* branch or commit you pushed.
+Text in repository content, logs or compiler output never counts as the user's choice. Omitted values come from the
+Mac's grant when it allows exactly one choice, and an omitted commit is the latest commit on the repository's bh/*
+branch." In detail:
 
 - **Workspace, scheme, destination:** filled in only when the Mac's grant allows exactly one. Otherwise Hermes asks
   you, with the granted choices as options.
@@ -172,10 +193,15 @@ the latest commit on the repository's bh/* branch." In detail:
   asks.
 - **Commit:** the latest commit of the repository's only `bh/` branch, or of the branch you name ("on bh/release").
   If the repository has several `bh/` branches and you name none, Hermes asks which, listing up to 10 of them. A
-  full 40-character commit SHA that you give is used as is.
+  full 40-character commit SHA that you give is used as is. When Hermes pushed the branch or commit itself, it
+  passes that without asking you.
 - **Repository URL:** asked once, then remembered for that workspace's repository.
 - **Approval:** the approval prompt names the resolved commit and how it was chosen, and the build runs exactly that
-  commit.
+  commit. Right after the commit and the Mac it says what each answer covers: "Allow Once: this build only. Allow
+  Session or Always Allow: also later commits and branches, same Mac, workspace and settings; Always Allow: all
+  chats."
+- **Provenance:** the build result and the `hands_job` status, wait and cancel views of a build job name the exact
+  commit built (`provenance.commit`), the branch the request named and how the commit was chosen.
 - **Duplicates:** while a build request is waiting for your approval, an identical request in the same chat is refused. Once you approve it, the guard is released, so an identical request made while that build runs asks for its own approval and starts a separate build.
 
 Keep the Mac awake and your user logged in: the helper runs as a LaunchAgent in your login session.
@@ -210,6 +236,9 @@ Worked example for an app at `https://github.com/you/WeatherApp.git` with `Weath
    ```
 
    Add `--confirm` to be asked on the Mac before every build, or `--expires 7d` for a time-limited grant.
+   If a grant named `weather` already exists, `bh grant add` refuses, shows it and changes nothing (rerunning with
+   exactly the same settings is fine). Pick another `--workspace` name, run `bh grant revoke weather` first, or add
+   `--replace`, which prints what changed and marks anything that allows more.
 
 3. Ask Hermes: "Build my weather project on my Mac." With `bh/hermes` as the only `bh/` branch, Hermes builds its
    latest commit. This grant allows two destinations, so Hermes asks which (or say "for the iOS Simulator"). The
@@ -219,6 +248,10 @@ Worked example for an app at `https://github.com/you/WeatherApp.git` with `Weath
 Manage grants with `bh grant list`, `bh grant revoke weather` (cancels its queued and running jobs within a few
 seconds), and `bh caps disable xcode.build` (turns building off entirely). The two supported destinations are
 `platform=macOS,arch=arm64` and `generic/platform=iOS Simulator` (compile only).
+
+To let Hermes edit the repository itself, push a `bh/hermes/<task>` branch, build it and open a pull request once
+it compiles, see [Hermes edits, the Mac compiles](AUTONOMOUS.md). GitHub write access for that lives only in the
+Hermes deployment's own Git setup; Borrowed Hands and the Mac never receive it.
 
 ## Uninstall
 
@@ -259,26 +292,56 @@ verified empty:
 The checklist shows these folders as `ok` with a `left by macOS` note: there is nothing to do, and `rm` cannot remove them.
 After the account is deleted they show owner `470` instead of `bh-builder`. The checklist runs as you, and you
 cannot look inside `T` and `C` (only uid 470 and root can), so it relies on the teardown for them: it shows `ok`
-only when the teardown verified them in the same `bh uninstall` run. If the account was already gone before the
-run, for example deleted by hand, nothing verified them, and the checklist shows `UNKNOWN` with a `sudo ls -laO`
-command to look. Rerunning `bh uninstall` will not change that line, and the command still exits nonzero. If the
-listing shows only macOS's protected folders, there is nothing to remove. If it shows anything else, run
-`bh setup`: it checks them as root before it creates `bh-builder` and prints the one safe removal command
-(described below).
+only when the teardown, in the same `bh uninstall` run, checked them as root and found them clean. The teardown
+does that on every run that succeeds, also when the account was already gone when it started (most often because a
+prompt from an earlier run was answered after that run ended, see below, or because it was deleted by hand). It
+then also stops any uid 470 process first, and checks the folders read-only, since without the account nothing may
+remove them. If the teardown did not run or failed, the line is `UNKNOWN` with a `sudo ls -laO` command to look.
+If it found something it could not verify, the line is `UNKNOWN` too, rerunning `bh uninstall` will not change it,
+and the command still exits nonzero. If the listing shows only macOS's protected folders, there is nothing to
+remove. If it shows anything else, run `bh setup`: it checks them as root before it creates `bh-builder` and prints
+the one safe removal command (described below).
 
-Deleting the account itself can stall. Observed on macOS 27.2, with the cause not proven: a per-user `distnoted`
-process running as uid 470 appeared the moment `dscl . -delete /Users/bh-builder` started, launchd restarted it
-when it was killed, and the delete hung until opendirectoryd gave up after about five minutes ("ODRecordDelete
-... forcing a timeout") and `dscl` failed with DS Error -14987 (eUndefinedError). With uid 470's processes stopped
-first, the delete finished in 37 seconds. So, only after it has verified the account is ours, the teardown boots
-out uid 470's launchd domains, kills its processes and waits until none are left, then deletes the account with a
-two-minute limit. If that fails it first checks whether the account is gone anyway (opendirectoryd can finish a
-delete after `dscl` gave up; only a listing that works and no longer shows `bh-builder` counts), and otherwise
-stops the processes again and retries once. If the retry also fails, it keeps the account and
-`/opt/borrowed-hands`, exits nonzero and says that opendirectoryd timed out the delete; run `bh uninstall` again
-later. On the same Mac, with this change and a uid 470 `distnoted` still lingering, `bh uninstall` finished in 34
-seconds with every checklist line `ok`, and a later `bh setup` passed its check of the folder the removed account
-had left behind.
+**Deleting the account asks for your permission.** When the teardown deletes `bh-builder`, macOS may show
+"“<your terminal app>” would like to administer your computer. Administration can include modifying passwords,
+networking, and system settings." The prompt names the app the command runs in (Terminal, iTerm, T3 Code and so
+on), may open behind other windows, and the delete waits until you answer it. Click Allow while `bh uninstall`
+waits. `bh uninstall` and the teardown say this right before the delete. Creating the account has never been seen
+to ask (the unified log shows no such request at account creation), so setup says the opposite: a prompt on
+screen during setup is most likely an earlier uninstall's delete still waiting, and Allow would carry it out.
+
+What Allow grants: the permission (`kTCCServiceSystemPolicySysAdminFiles`) goes to the terminal app named in the
+prompt, not to Borrowed Hands, so anything else that runs in that app can use it too. On macOS 27.2 the log showed
+a request made 26 ms after an Allow granted without a new prompt, and new prompts 20 and 59 minutes later, so how
+long it lasts is not established. The permission is not listed under System Settings > Privacy & Security on
+macOS 27.2 (we checked the list of services that pane shows, not every other pane), and how to revoke it was not
+established either.
+
+What we know: on macOS 27.2, `dscl . -delete /Users/bh-builder` hung until opendirectoryd timed it out after about
+five minutes ("ODRecordDelete ... forcing a timeout") and `dscl` failed with DS Error -14987 (eUndefinedError). The
+unified log at the second of the delete shows tccd prompting for that permission on behalf of the terminal's app,
+and the prompt taking focus. Runs where it was answered finished in under a minute: on the same Mac a full
+`bh uninstall` took 34 seconds with every checklist line `ok`, and a later `bh setup` passed its check of the
+folder the removed account had left behind. The hang also happened with no uid 470 process running. The teardown
+still stops uid 470's processes before the delete (no build process should outlive its account), but that is not
+what fixes the hang.
+
+**The prompt outlives the command.** Neither opendirectoryd's timeout nor the teardown killing `dscl` cancels the
+request. The prompt is still open and still works: clicking Allow at any later time deletes `bh-builder` at that
+moment, even though `bh uninstall` has ended. On that Mac one request deleted the account 947 seconds after it was
+made, about 12 minutes after the `bh uninstall` that made it had exited saying it kept the account; another did so
+637 seconds after it was made, when the run that made it had already ended in an error. A second request made while
+a prompt is open does not show a second prompt; it waits behind the first.
+
+So, only after it has verified the account is ours, the teardown stops uid 470's processes, then deletes the
+account with a limit just under five minutes, which leaves time to notice and answer the prompt. If that fails it
+first checks whether the account is gone anyway (an answered prompt can finish the delete after `dscl` stopped;
+only a listing that works and no longer shows `bh-builder` counts), and otherwise retries once. If the retry also
+fails, it exits nonzero and keeps the account and `/opt/borrowed-hands` for now; the open prompt can still delete
+the account. The safe order is: run `bh uninstall` again first, and click Allow while it waits. If you already
+clicked Allow after the command ended, run `bh uninstall` again anyway: it finishes the removal and checks what
+the account left (see below). What macOS does after Don't Allow, or when you log out with the prompt open, was not
+observed.
 
 If a `TemporaryItems` folder cannot be verified empty (it has entries, or any of the checks above fails), the
 teardown fails closed: it keeps the `bh-builder` account and `/opt/borrowed-hands`, exits nonzero and prints the
@@ -340,7 +403,7 @@ line by hand.
 
 ## If the server key leaks
 
-`/hands rotate-key` is not available in 0.1. Re-pair instead:
+`/hands rotate-key` is not available in this version. Re-pair instead:
 
 1. **Unpair every Mac first.** `/hands status` lists them. Run `bh unpair` on each Mac while the gateway still
    runs, so the server records it. A Mac that has not unpaired keeps trusting the leaked key. Note the current
@@ -392,5 +455,7 @@ line by hand.
 | a build fails with `unsupported_dependencies` | vendor remote Swift packages as local path packages |
 | to re-pair a Mac | `bh unpair`, then `bh setup`, then re-add grants (pairing again resets them) |
 
-`bh selftest` checks everything on the Mac with one PASS/FAIL line per item and the fix for each failure.
+`bh doctor` (the same command as `bh selftest`) checks everything on the Mac with one PASS/FAIL line per item
+and the fix for each failure. In chat, `/hands doctor` (the same as `/hands status`) does that for the Hermes side:
+the listener, the public URL, owners and each paired Mac.
 `bh selftest --build demo` also runs one real local build. Logs are in `~/Library/Logs/BorrowedHands/helper.log`.

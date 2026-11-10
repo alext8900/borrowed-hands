@@ -36,7 +36,8 @@ def test_install_check_requires_root_ownership(tmp_path):
 
 
 def test_install_check_ok_when_owner_matches(tmp_path):
-    st = caps.production_install(fake_prefix(tmp_path), root_uid=os.getuid(), check_parents=False)
+    st = caps.production_install(fake_prefix(tmp_path), root_uid=os.getuid(), check_parents=False,
+                                 account=lambda: None)
     assert st.ok, st.problems
 
 
@@ -99,7 +100,7 @@ def test_caps_body_no_xcode_build_on_test_install():
 
 
 def test_caps_expiry_is_ms():
-    cfg = H.paired_config().with_workspace(H.workspace(expires_at=1893456000000))
+    cfg = H.paired_config().with_workspace(H.workspace(expires_at=1893456000000), replace_existing=True)
     body = caps.caps_body(cfg, GOOD, busy=False, queue_depth=0, host=caps.Host("26.2", "arm64"))
     xb = [c for c in body["capabilities"] if c["name"] == "xcode.build"][0]
     assert xb["workspaces"][0]["expires_at"] == 1893456000000
@@ -304,3 +305,52 @@ def test_xcode_license_and_first_launch_fixes_target_the_runner_copy():
         s = caps.xcode_status(xrun({SEL: (0, selected + "\n"), VER: (1, ""), LIC: (0, "")}))
         assert s.version is None and f"'{pinned} -runFirstLaunch'" in s.fix
         assert "sudo xcodebuild" not in s.fix
+
+
+# ---- Security review round 1 F3: an open "administer your computer" prompt from an uninstall can delete bh-builder after the
+# command ended, leaving the dispatcher in place. A dispatcher without its build user is not a ready install.
+def _pw(uid, gid):
+    from types import SimpleNamespace
+    return lambda name: SimpleNamespace(pw_uid=uid, pw_gid=gid) if name == "bh-builder" else None
+
+
+def _gone(name):
+    raise KeyError(name)
+
+
+def test_install_check_needs_the_build_user(tmp_path):
+    p = fake_prefix(tmp_path)
+    ok = caps.production_install(p, root_uid=os.getuid(), check_parents=False,
+                                 account=lambda: caps.builder_account_problem(_pw(470, 470), _gr(470)))
+    assert ok.ok, ok.problems
+    st = caps.production_install(p, root_uid=os.getuid(), check_parents=False,
+                                 account=lambda: caps.builder_account_problem(_gone, _gr(470)))
+    assert not st.ok and st.problems == (caps.BUILDER_MISSING,), st.problems
+    assert "bh uninstall" in caps.BUILDER_MISSING and "bh setup" in caps.BUILDER_MISSING
+
+
+@pytest.mark.parametrize("uid,gid", [(471, 470), (470, 20), (501, 20)])
+def test_install_check_refuses_a_bh_builder_that_is_not_ours(tmp_path, uid, gid):
+    st = caps.production_install(fake_prefix(tmp_path), root_uid=os.getuid(), check_parents=False,
+                                 account=lambda: caps.builder_account_problem(_pw(uid, gid), _gr(470)))
+    assert not st.ok and any("bh-builder" in p and f"{uid}:{gid}" in p for p in st.problems), st.problems
+
+
+def test_the_default_install_check_looks_up_the_account():
+    import inspect
+    assert inspect.signature(caps.production_install).parameters["account"].default is caps.builder_account_problem
+
+
+def _gr(gid):
+    from types import SimpleNamespace
+    return lambda name: SimpleNamespace(gr_gid=gid) if name == "bh-builder" else None
+
+
+# ---- Security review round 2 N5: the LaunchDaemon names both UserName and GroupName bh-builder: the group must be there too
+@pytest.mark.parametrize("group,ok", [(_gr(470), True), (_gone, False), (_gr(20), False)])
+def test_install_check_needs_the_build_group(tmp_path, group, ok):
+    st = caps.production_install(fake_prefix(tmp_path), root_uid=os.getuid(), check_parents=False,
+                                 account=lambda: caps.builder_account_problem(_pw(470, 470), group))
+    assert st.ok is ok, st.problems
+    if not ok:
+        assert any("group bh-builder" in p for p in st.problems), st.problems

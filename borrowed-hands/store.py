@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Optional
 
-from . import bhproto
+from . import bhproto, refs
 
 SCHEMA_VERSION = 1
 
@@ -116,6 +116,26 @@ def _job(row) -> Optional[Job]:
                row["updated_at"], row["expires_at"],
                json.loads(row["result_json"]) if row["result_json"] else None,
                json.loads(row["error_json"]) if row["error_json"] else None)
+
+
+COMMIT_EXPLICIT = "explicit commit"
+COMMIT_EXPLICIT_BRANCH = "explicit commit; branch not checked"
+
+
+def source_fields(branch: Any, commit_source: Any) -> Optional[dict]:
+    """The stored provenance fields if well formed, else None: a bh/* branch name, and a commit source that is
+    one of the fixed explicit-commit strings or "latest on <bh/* branch>"."""
+    if branch is not None and not refs.valid_branch(branch):          # bh/<name>, 200 characters, git ref rules
+        return None
+    if not isinstance(commit_source, str):
+        return None
+    if commit_source not in (COMMIT_EXPLICIT, COMMIT_EXPLICIT_BRANCH) and not (
+            commit_source.startswith("latest on ") and refs.valid_branch(commit_source[len("latest on "):])):
+        return None
+    out = {"commit_source": commit_source}
+    if branch is not None:
+        out["branch"] = branch
+    return out
 
 
 class Store:
@@ -220,12 +240,27 @@ class Store:
 
     # ------------------------------------------------------------ jobs
     def insert_job(self, *, job_id: str, helper_id: str, action: str, contract: bytes, sig: str,
-                   contract_hash: str, nonce: str, session_id: str, now: int, expires_at: int) -> None:
-        self._conn().execute(
-            "INSERT INTO jobs(job_id, helper_id, action, contract, sig, contract_hash, nonce, state, session_id,"
-            " created_at, updated_at, expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (job_id, helper_id, action, bytes(contract), sig, contract_hash, nonce, JobState.PENDING_SEND.value,
-             session_id, now, now, expires_at))
+                   contract_hash: str, nonce: str, session_id: str, now: int, expires_at: int,
+                   source: Any = None) -> None:
+        """Insert a job. `source` ({"branch", "commit_source"} for a build) is stored in the same transaction as
+        the contract, so it is durable before anything is dispatched or awaited; an invalid one is not stored."""
+        fields = source_fields(source.get("branch"), source.get("commit_source")) \
+            if isinstance(source, dict) else None
+        c = self._conn()
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            c.execute(
+                "INSERT INTO jobs(job_id, helper_id, action, contract, sig, contract_hash, nonce, state, session_id,"
+                " created_at, updated_at, expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (job_id, helper_id, action, bytes(contract), sig, contract_hash, nonce, JobState.PENDING_SEND.value,
+                 session_id, now, now, expires_at))
+            if fields is not None:
+                c.execute("INSERT OR IGNORE INTO meta(k, v) VALUES(?, ?)",
+                          (f"job_source:{job_id}", json.dumps(fields, sort_keys=True)))
+            c.execute("COMMIT")
+        except BaseException:
+            c.execute("ROLLBACK")
+            raise
 
     def get_job(self, job_id: str) -> Optional[Job]:
         return _job(self._conn().execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone())
@@ -237,6 +272,14 @@ class Store:
             q += " AND helper_id=?"
             args = (helper_id,)
         return [_job(r) for r in self._conn().execute(q + " ORDER BY created_at", args)]
+
+    def newer_terminal_builds(self, job_id: str) -> List[Job]:
+        """Every finished xcode.build job stored after `job_id` (insertion order, which is creation order: jobs are
+        only ever inserted, never deleted or re-inserted), any Mac. Empty if `job_id` is unknown. A stored state
+        this code does not know is selected too, so it raises here instead of being skipped."""
+        return [_job(r) for r in self._conn().execute(
+            f"SELECT * FROM jobs WHERE action='xcode.build' AND state NOT IN {NONTERMINAL_SQL}"
+            " AND rowid > (SELECT rowid FROM jobs WHERE job_id=?) ORDER BY rowid", (job_id,))]
 
     def mark_sent(self, job_id: str, *, now: int) -> bool:
         cur = self._conn().execute(
@@ -303,6 +346,28 @@ class Store:
         try:
             return row[0] if row is not None and bhproto.repo_fingerprint(row[0]) == fingerprint else None
         except Exception:
+            return None
+
+    # ------------------------------------------------------------ how a build's commit was chosen
+    # Plugin-side provenance for a build job: the bh/* branch the call requested (if any) and how the commit was
+    # chosen. The signed contract carries only the commit (it has no branch field), so this is kept beside it, in
+    # meta (no DDL). Written once (INSERT OR IGNORE), normally by insert_job in the contract's own transaction;
+    # never rewritten, and never inferred later from a ref read.
+    def remember_job_source(self, job_id: str, *, branch: Optional[str], commit_source: Optional[str]) -> bool:
+        """True if stored; False if invalid or a source is already recorded for this job (it is kept)."""
+        source = source_fields(branch, commit_source)
+        if source is None:
+            return False
+        cur = self._conn().execute("INSERT OR IGNORE INTO meta(k, v) VALUES(?, ?)",
+                                   (f"job_source:{job_id}", json.dumps(source, sort_keys=True)))
+        return cur.rowcount == 1
+
+    def job_source(self, job_id: str) -> Optional[dict]:
+        row = self._conn().execute("SELECT v FROM meta WHERE k=?", (f"job_source:{job_id}",)).fetchone()
+        try:
+            d = json.loads(row[0]) if row is not None else None
+            return source_fields(d.get("branch"), d.get("commit_source")) if isinstance(d, dict) else None
+        except ValueError:
             return None
 
     # ------------------------------------------------------------ notices and audit

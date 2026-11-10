@@ -179,7 +179,7 @@ def test_8_no_grant(env):
 
 
 def test_8_grant_expired(env):
-    env.cfg = env.cfg.with_workspace(H.workspace(expires_at=H.NOW))
+    env.cfg = env.cfg.with_workspace(H.workspace(expires_at=H.NOW), replace_existing=True)
     assert code(submit(env, H.contract()))[0] == "needs_grant"
 
 
@@ -213,25 +213,25 @@ def test_10_repo_mismatch(env):
 
 # ---- step 11: device confirm
 def test_11_confirm_allow(env):
-    env.cfg = env.cfg.with_workspace(H.workspace(confirm=True))
+    env.cfg = env.cfg.with_workspace(H.workspace(confirm=True), replace_existing=True)
     assert isinstance(submit(env, H.contract()), AcceptedJob)
     assert env.confirm_calls and env.confirm_calls[0]["scheme"] == "Demo"
 
 
 def test_11_confirm_deny(env):
-    env.cfg = env.cfg.with_workspace(H.workspace(confirm=True))
+    env.cfg = env.cfg.with_workspace(H.workspace(confirm=True), replace_existing=True)
     env.confirm_answer = False
     assert code(submit(env, H.contract()))[0] == "denied"
 
 
 def test_11_confirm_timeout_is_deny(env):
-    env.cfg = env.cfg.with_workspace(H.workspace(confirm=True))
+    env.cfg = env.cfg.with_workspace(H.workspace(confirm=True), replace_existing=True)
     env.confirm_answer = None
     assert code(submit(env, H.contract())) == ("denied", "device_confirm_timeout")
 
 
 def test_11_not_for_system_info(env):
-    env.cfg = env.cfg.with_workspace(H.workspace(confirm=True))
+    env.cfg = env.cfg.with_workspace(H.workspace(confirm=True), replace_existing=True)
     assert isinstance(submit(env, H.contract(action="system.info")), AcceptedJob)
     assert env.confirm_calls == []
 
@@ -291,14 +291,14 @@ def test_order_allowlist_before_fingerprint(env):
 
 
 def test_order_fingerprint_before_confirm(env):
-    env.cfg = env.cfg.with_workspace(H.workspace(confirm=True))
+    env.cfg = env.cfg.with_workspace(H.workspace(confirm=True), replace_existing=True)
     fp = bhproto.repo_fingerprint("https://github.com/someone/else")
     assert code(submit(env, H.contract(params=H.build_params(repo_fingerprint=fp))))[0] == "needs_resolution"
     assert env.confirm_calls == []
 
 
 def test_order_confirm_before_capacity(env):
-    env.cfg = env.cfg.with_workspace(H.workspace(confirm=True))
+    env.cfg = env.cfg.with_workspace(H.workspace(confirm=True), replace_existing=True)
     env.confirm_answer = False
     env.room = False
     assert code(submit(env, H.contract()))[0] == "denied"

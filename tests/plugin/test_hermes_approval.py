@@ -67,7 +67,8 @@ def call(args):
 def test_session_approval_grain(hermes):
     seen = answer("session")
     r = call(BUILD)
-    assert seen and "Build demo (scheme Demo, Debug, macOS arm64) at commit 5555555" in seen[0]
+    assert seen and "Build at commit 5555555555 on Mac 6a1e2b3c." in seen[0]
+    assert "Settings: demo (scheme Demo, Debug, macOS arm64)" in seen[0]
     assert "helper_unavailable" in r          # approved, then the stub handler ran
     seen = answer("deny")
     r = call({**BUILD, "commit": "6" * 40})
@@ -117,13 +118,18 @@ def _friendly_setup(hermes, monkeypatch, shas):
     return mod
 
 
+def mod_scope_hint(hermes):
+    return hermes._plugins["borrowed-hands"].module.hooks.SCOPE_HINT
+
+
 def test_omitted_commit_is_resolved_before_the_real_approval_prompt(hermes, monkeypatch):
     """Friendly build in real Hermes: no commit, the prompt names the resolved SHA and how it was chosen."""
     _friendly_setup(hermes, monkeypatch, ["34497174041223af2f6d51c17c85caa4bb6f61a7"])
     seen = answer("once")
     r = call({"helper_id": BUILD["helper_id"]})
-    assert seen and ("Build demo (scheme Demo, Debug, macOS arm64) at commit 3449717 (latest on bh/fixed) "
-                     "on Macbook Pro M5 Max") in seen[0]
+    assert seen and ("Build at commit 3449717404 (latest on bh/fixed) on Macbook Pro M5 Max. "
+                     + mod_scope_hint(hermes)) in seen[0]
+    assert "Settings: demo (scheme Demo, Debug, macOS arm64)" in seen[0]
     assert "helper_unavailable" in r          # approved, then the handler found no listener in this process
 
 

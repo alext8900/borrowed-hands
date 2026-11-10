@@ -1,5 +1,5 @@
 name: borrowed-hands
-version: 0.1.0
+version: 0.2.0
 description: "Borrow locally granted Xcode builds and system info from a Mac you paired. The Mac dials out and decides."
 author: Alex Thompson
 requires_hermes: ">=0.22.7"

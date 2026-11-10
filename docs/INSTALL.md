@@ -68,7 +68,7 @@ setting behind another proxy. Railway redeploys when variables change (about a m
   on later boots, and one `[bh-start] seeded ...` line.
 - `/opt/data/logs/agent.log` (read it as the `hermes` user) shows
   `borrowed_hands: listener up on 0.0.0.0:8790 (server key <16 hex>)` and
-  `borrowed_hands: registered (v0.1.0, listener up) in <n> ms`, once per gateway boot. With local Docker:
+  `borrowed_hands: registered (v0.2.0, listener up) in <n> ms`, once per gateway boot. With local Docker:
   `docker exec --user hermes <container> grep 'borrowed_hands:' /opt/data/logs/agent.log`.
 - The listener starts only in `hermes gateway run`. `hermes plugins validate`, doctor and other CLI processes never
   open the port.
@@ -126,7 +126,8 @@ TLS reverse proxy that forwards `https://<host>/bh/v1/` to the listener and allo
 | `[bh-start] ERROR: config merge refused (...)` | startup stopped before Hermes init and the original config is unchanged; fix the persisted config (see the startup config policy) |
 | `/hands status`: "Listener: off (not the gateway process ...)" | not started by `hermes gateway run`; do not override the start command |
 | `/hands status`: "Public URL: not set" | set `public_url` / `BH_PUBLIC_URL` (or generate the Railway domain) and restart |
-| "Only the Borrowed Hands owner can do that." | your `platform:user_id` is not in `owners` / `BH_OWNERS` |
+| "Only the Borrowed Hands owner can do that." | your `platform:user_id` is not in `owners` / `BH_OWNERS`; `/hands whoami` in a DM prints the exact value to add |
+| "No owner is configured ..." | `owners` / `BH_OWNERS` is empty; `/hands whoami` in a DM prints your value, set it and restart |
 | "Run /hands pair in a direct message with me ..." | pairing only works in a DM, never in a group |
 | 502 for 10 to 20 s after a redeploy | expected while the new container starts; the Mac helper is designed to reconnect on its own |
 
@@ -142,11 +143,14 @@ bh pair '<pairing string>'
 Use it at the pairing step of `bh setup` (paste only the part starting with `bh1:`), or run that command on the Mac
 yourself. Each new `/hands pair` invalidates earlier unused strings. Once the Mac connects, the bot edits the
 pairing message to remove the secret and later replies `<Mac> is ready.` with the capabilities the Mac granted.
-`/hands status` shows the listener, the public URL, owners and paired Macs.
+`/hands status` (also `/hands doctor`) shows the listener, the public URL, owners and paired Macs.
+`/hands whoami`, in a DM, answers anyone with their own `platform:user_id` and whether it is an owner; it changes
+nothing.
 
 ## Mac helper reference
 
-Install with `uv tool install ./helper` from a checkout of this repository, then `uv tool update-shell` and open a
+Install with `uv tool install "git+https://github.com/alext8900/borrowed-hands@v0.2.0#subdirectory=helper"`
+(or `uv tool install ./helper` from a checkout of this repository), then `uv tool update-shell` and open a
 new terminal. The helper needs the whole checkout: its package includes the protocol schemas and the sandbox
 scripts. `bh setup` then runs these steps, skipping any that are already done:
 
@@ -175,6 +179,8 @@ not request Screen Recording.
 Manual equivalents after pairing: `bh caps enable system.info`, `bh caps enable xcode.build`, `bh grant add ...`,
 `bh service install`. Other commands: `bh status`, `bh grant list`, `bh grant revoke <workspace>`,
 `bh caps disable xcode.build`, `bh jobs`, `bh cancel <job id>`, `bh unpair`, `bh rotate-key`, `bh run` (foreground).
+`bh grant add` never silently replaces a grant with the same `--workspace` name: it refuses and shows the existing
+one, unless the settings are identical or you pass `--replace` (which prints the before and after).
 
 ### Helper messages
 

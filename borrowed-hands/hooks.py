@@ -106,7 +106,6 @@ def rule_key(tool_name: str, fields: Dict[str, Any]) -> str:
 _PLAIN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._+-]{0,31}")
 _WORKSPACE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 _HEX40 = re.compile(r"[0-9a-f]{40}")
-_SOURCE = re.compile(r"latest on bh/[A-Za-z0-9._/-]{1,60}")
 _MARKUP = set('`*_[]<>|#~"()' + chr(92))
 SHOWN_MAX = 40
 
@@ -145,42 +144,86 @@ def _shown(field: str, value: Any) -> str:
     return f'"{text}"' if text else f'"(empty {field})"'
 
 
+# What each approval answer covers (rule_key), in Hermes's own button words. Hermes cuts a long reason from the
+# end to a per-platform budget measured after escaping (gateway/platforms/base.py fit_prefix/_ea_fit; Discord 300,
+# Telegram and Slack 500), so build_reason() puts the Mac, the commit and how it was chosen first, then this
+# sentence, then the long settings: with every head part capped, head + sentence fit in 300 escaped characters.
+# That needs a 40-hex commit and a valid branch: tools.fill_build refuses anything else before a card is shown.
+SCOPE_HINT = ("Allow Once: this build only. Allow Session or Always Allow: also later commits and branches, same Mac, "
+              "workspace and settings; Always Allow: all chats.")
+REASON_HEAD_BUDGET = 300           # the smallest Hermes reason budget (Discord)
+BRANCH_SHOWN_MAX = 28              # a branch in the reason head; longer names are cut to 25 characters plus "..."
+SHA_SHOWN = 10                     # hex characters of the commit on the card (10 still fits the worst case in 300)
+_BRANCH_CHARS = re.compile(r"bh/[A-Za-z0-9._/-]+")
+
 DESTINATION_LABELS = {"platform=macOS,arch=arm64": "macOS arm64", "generic/platform=iOS Simulator": "iOS Simulator"}
+
+
+def _branch_shown(branch: Any) -> str:
+    """A bh/* name in the branch character set bare (cut to BRANCH_SHOWN_MAX), anything else via _shown."""
+    if isinstance(branch, str) and _BRANCH_CHARS.fullmatch(branch):
+        return branch if len(branch) <= BRANCH_SHOWN_MAX else branch[:BRANCH_SHOWN_MAX - 3] + "..."
+    return f"branch {_shown('branch', branch)}"
+
+
+def _where(fields: Dict[str, Any], helper_name: Optional[str], prefer_id: bool = False) -> str:
+    helper_ref = fields.get("helper_id")
+    if helper_name and isinstance(helper_name, str) and _MAC_NAME.fullmatch(helper_name):
+        return f" on {helper_name}"
+    prefix = str(helper_ref)[:8] if helper_ref else ""
+    if prefix and _ID_PREFIX.fullmatch(prefix) and (prefer_id or not helper_name):
+        return f" on Mac {prefix}"
+    if helper_name:
+        return f" on Mac {_shown('Mac name', helper_name)}"
+    return f" on Mac {_shown('Mac', helper_ref)}" if helper_ref else ""
+
+
+def _build_parts(fields: Dict[str, Any], commit_source: Optional[str]) -> Tuple[str, str, str]:
+    """(at, how, settings) of a build reason, every model- or repository-supplied value sanitized."""
+    dest = fields.get("destination")
+    dest = DESTINATION_LABELS.get(dest) if isinstance(dest, str) else None
+    if dest is None:
+        dest = f"destination {_shown('destination', fields.get('destination'))}" \
+            if fields.get("destination") else "default destination"
+    commit = fields.get("commit")
+    if isinstance(commit, str) and _HEX40.fullmatch(commit):
+        at = f"at commit {commit[:SHA_SHOWN]}"
+    else:
+        at = f"at commit {_shown('commit', commit)}" if commit else "at an unresolved commit"
+    how = ""
+    if isinstance(commit_source, str) and commit_source.startswith("latest on "):
+        how = f" (latest on {_branch_shown(commit_source[len('latest on '):])})"
+    branch = fields.get("branch")
+    if commit_source is None and branch:        # an explicit commit with a branch: show it, it is not compared
+        how = f" ({_branch_shown(branch)} requested, unchecked)"
+    workspace = fields.get("workspace_id")
+    if not (isinstance(workspace, str) and _WORKSPACE.fullmatch(workspace)):
+        workspace = f"workspace {_shown('workspace', workspace)}"
+    scheme, configuration = fields.get("scheme"), fields.get("configuration")
+    scheme = f"scheme {scheme}" if _plain(scheme) else f"scheme {_shown('scheme', scheme)}"
+    if not _plain(configuration):
+        configuration = f"configuration {_shown('configuration', configuration)}"
+    return at, how, f"{workspace} ({scheme}, {configuration}, {dest})"
+
+
+def build_reason(fields: Dict[str, Any], helper_name: Optional[str], commit_source: Optional[str] = None) -> str:
+    """The build approval reason, ordered for Hermes's tail truncation: Mac, commit and how it was chosen, then
+    SCOPE_HINT, then the settings, e.g. "Build at commit 3449717404 (latest on bh/fixed) on Macbook Pro M5 Max.
+    <SCOPE_HINT> Settings: demo (scheme Demo, Debug, macOS arm64)". The head shows a Mac whose name is not a plain
+    pairing-style name by its id prefix, so every head part is bounded and needs no escaping."""
+    at, how, settings = _build_parts(fields, commit_source)
+    return f"Build {at}{how}{_where(fields, helper_name, prefer_id=True)}. {SCOPE_HINT} Settings: {settings}"
 
 
 def describe(tool_name: str, fields: Dict[str, Any], helper_name: Optional[str],
              commit_source: Optional[str] = None) -> str:
-    """The approval reason a person reads, e.g. "Build demo (scheme Demo, Debug, macOS arm64) at commit 3449717
-    (latest on bh/fixed) on Macbook Pro M5 Max". Hermes shows it beside its own fixed plugin-rule label."""
-    helper_ref = fields.get("helper_id")
-    if helper_name:
-        where = f" on {helper_name}" if isinstance(helper_name, str) and _MAC_NAME.fullmatch(helper_name) else \
-            f" on Mac {_shown('Mac name', helper_name)}"
-    elif helper_ref:
-        prefix = str(helper_ref)[:8]
-        where = f" on Mac {prefix}" if _ID_PREFIX.fullmatch(prefix) else f" on Mac {_shown('Mac', helper_ref)}"
-    else:
-        where = ""
+    """A one-line description, e.g. "Build demo (scheme Demo, Debug, macOS arm64) at commit 3449717404 (latest on
+    bh/fixed) on Macbook Pro M5 Max" or "Capture display 1 (max 1600 px) on <Mac>". The build approval reason is
+    build_reason(), which orders the same parts for truncation."""
+    where = _where(fields, helper_name)
     if tool_name == "hands_xcode_build":
-        dest = fields.get("destination")
-        dest = DESTINATION_LABELS.get(dest) if isinstance(dest, str) else None
-        if dest is None:
-            dest = f"destination {_shown('destination', fields.get('destination'))}" \
-                if fields.get("destination") else "default destination"
-        commit = fields.get("commit")
-        if isinstance(commit, str) and _HEX40.fullmatch(commit):
-            at = f"at commit {commit[:7]}"
-        else:
-            at = f"at commit {_shown('commit', commit)}" if commit else "at an unresolved commit"
-        how = f" ({commit_source})" if isinstance(commit_source, str) and _SOURCE.fullmatch(commit_source) else ""
-        workspace = fields.get("workspace_id")
-        if not (isinstance(workspace, str) and _WORKSPACE.fullmatch(workspace)):
-            workspace = f"workspace {_shown('workspace', workspace)}"
-        scheme, configuration = fields.get("scheme"), fields.get("configuration")
-        scheme = f"scheme {scheme}" if _plain(scheme) else f"scheme {_shown('scheme', scheme)}"
-        if not _plain(configuration):
-            configuration = f"configuration {_shown('configuration', configuration)}"
-        return f"Build {workspace} ({scheme}, {configuration}, {dest}) {at}{how}{where}"
+        at, how, settings = _build_parts(fields, commit_source)
+        return f"Build {settings} {at}{how}{where}"
     display, max_px = fields.get("display"), fields.get("max_px")
     display = display if _small_int(display) else _shown("display", display)
     max_px = max_px if _small_int(max_px) else _shown("size", max_px)
@@ -380,8 +423,9 @@ def _pre_tool_call(tool_name, args, session_id, tool_call_id, token):
                 return CONFLICT
         except TicketStoreFull:
             return BUSY
-        return {"action": "approve", "message": describe(tool_name, fields, name, source),
-                "rule_key": rule_key(tool_name, fields)}
+        message = build_reason(fields, name, source) if tool_name == "hands_xcode_build" \
+            else describe(tool_name, fields, name, source)
+        return {"action": "approve", "message": message, "rule_key": rule_key(tool_name, fields)}
     except Exception as exc:  # never raise: still ask, with the coarsest safe description
         log.warning("borrowed_hands: approval hook error (%s)", type(exc).__name__)
         return {"action": "approve", "message": f"Borrowed Hands: {tool_name}", "rule_key": f"{tool_name}:{uuid.uuid4()}"}

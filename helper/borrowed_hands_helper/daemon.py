@@ -204,9 +204,21 @@ class Deps:
     sweep_retry_s: float = 10.0      # first retry of a failed start-up cleanup; doubles up to 300 s
 
 
+PAIRING_GONE = ("config.toml no longer names the server this helper was paired with; stopped. "
+                "Run 'bh status' (and 'bh setup' to pair again).")
+
+
 def default_deps() -> Deps:
     from .executors import load_executors
     return Deps(executors=load_executors(), probes=capsmod.probe, host=capsmod.host)
+
+
+_UNSET = object()        # "no version": never equal to config.mtime(), which is None for a missing file
+_REVOKED = {"code": "cancelled", "message": "the job was cancelled", "detail": {"reason": "revoked"}}
+
+
+class _PinChanged(Exception):
+    """config.toml no longer holds the server pin this helper has in memory."""
 
 
 class Daemon:
@@ -214,7 +226,14 @@ class Daemon:
         self.home = Path(home)
         self.d = deps
         self.cfg: Optional[Config] = None
-        self.cfg_mtime = None
+        self.cfg_mtime = _UNSET
+        self._rejected_mtime = _UNSET    # the version last refused (reported once; retried every poll)
+        self._rotating = None            # the pin a server.rotate is writing, until it is the pin in memory
+        self._halt = asyncio.Event()     # set by the watcher when the pairing on disk is gone or different
+        self._halt_code = 1
+        self._cancel_done: set[str] = set()   # jobs whose cancel call completed (not retried)
+        self._failures: dict = {}             # what is failing now -> its last logged error (logged once)
+        self._last_probe = time.monotonic()
         self.priv = None
         self.store: Optional[JobStore] = None
         self.probes: Optional[capsmod.Probes] = None
@@ -243,8 +262,9 @@ class Daemon:
     async def run(self) -> int:
         try:
             keyfile.check_private_dir(self.home)
-            self.cfg = config.load(self.home)
+            # mtime first: a write after it makes the file newer than what was loaded, so the watcher reloads
             self.cfg_mtime = config.mtime(self.home)
+            self.cfg = config.load(self.home)
             if self.cfg.server is None or not keyfile.has_device_key(self.home):
                 print("this Mac is not paired: run 'bh setup' (or 'bh pair')", flush=True)
                 return 3
@@ -286,10 +306,23 @@ class Daemon:
             if not clean:
                 workers.append(asyncio.create_task(self._retry_cleanup()))
             try:
-                stop = await run_forever(lambda: self.cfg.server, lambda: self.priv, self._on_session,
-                                         timing=self.d.timing, connect=self.d.connect, rand=self.d.rand,
-                                         sleep=self.d.sleep, clock=self.d.clock, on_status=self._set_status,
-                                         retry_after=lambda: self._retry_after)
+                conn = asyncio.create_task(run_forever(
+                    lambda: self.cfg.server, lambda: self.priv, self._on_session,
+                    timing=self.d.timing, connect=self.d.connect, rand=self.d.rand,
+                    sleep=self.d.sleep, clock=self.d.clock, on_status=self._set_status,
+                    retry_after=lambda: self._retry_after))
+                halt = asyncio.create_task(self._halt.wait())
+                try:
+                    await asyncio.wait({conn, halt}, return_when=asyncio.FIRST_COMPLETED)
+                finally:                  # also when this task is cancelled: the connection never outlives it
+                    for t in (halt, conn):
+                        if not t.done():
+                            t.cancel()
+                    await asyncio.gather(halt, conn, return_exceptions=True)
+                if self._halt.is_set():   # the session is closed and the key dropped; config.toml is not touched
+                    print(PAIRING_GONE, flush=True)
+                    return self._halt_code
+                stop = conn.result()
                 print(stop.message, flush=True)
                 if stop.unpaired:
                     await self._forget_pairing()
@@ -538,6 +571,9 @@ class Daemon:
             if row.terminal:
                 await self._send("job.result", self.store.result_body(row))
             return
+        if self._halt.is_set():          # the pairing is gone: nothing new is queued while the helper stops
+            await self._finish(out.job_id, "cancelled", None, _REVOKED)
+            return
         # 13. queued, then accepted (no await between the capacity check and the enqueue)
         self.store.set_state(out.job_id, "queued", self.d.clock())
         if out.workspace is not None:
@@ -636,6 +672,10 @@ class Daemon:
 
         # Final gate, with no await between it and ex.run: a cancel or revoke that arrived during the awaits
         # above (when there was no process to stop yet) is honoured here (HIGH 2).
+        if self._halt.is_set():          # before the stopping branch: that one puts the job back to queued
+            self._cancel_reason.pop(job.job_id, None)
+            await self._finish(job.job_id, "cancelled", None, _REVOKED)
+            return
         if self._stopping or (job.action == "xcode.build" and self._build_block is not None):
             # Never started: back to queued (it resumes after the restart or the cleanup), not cancelled.
             self._cancel_reason.pop(job.job_id, None)
@@ -725,9 +765,33 @@ class Daemon:
             await self._send("error", {"code": "denied", "message": "rotation proof failed",
                                        "detail": {"reason": "bad_signature"}}, re=f.id)
             return
-        self.cfg = replace(self.cfg, server=replace(old, pubkey=new_pub, key_id=b["new_key_id"]))
-        config.save(self.home, self.cfg)
-        self.cfg_mtime = config.mtime(self.home)
+        pin = replace(old, pubkey=new_pub, key_id=b["new_key_id"])
+
+        def swap(cfg):
+            # Change only the pin of what is on disk now (this copy's grants may be older than the file), and only
+            # if the file still holds the pin this helper has: a pin the owner removed or changed is never put back.
+            if cfg.server != old:
+                raise _PinChanged()
+            return replace(cfg, server=pin)
+        self._rotating = pin            # the watcher must not take the rotated file for a foreign pin
+        try:
+            await asyncio.to_thread(config.update, self.home, swap)
+            self.cfg = replace(self.cfg, server=pin)
+        except (_PinChanged, ConfigError, keyfile.UnsafeKeyStorage, OSError) as e:
+            changed = isinstance(e, _PinChanged)
+            log.error("server.rotate refused, nothing written: %s",
+                      "config.toml no longer holds this server's pin" if changed else e)
+            self.cfg_mtime = _UNSET      # look at the file again on the next poll (a changed pin stops the helper)
+            await self._send("error", {"code": "denied", "message": "the Mac could not store the new server key",
+                                       "detail": {"reason": "pin_changed" if changed else "config_unavailable"}},
+                             re=f.id)
+            return
+        finally:
+            self._rotating = None
+        # Reload what is on disk now. The watcher already retries any version it could not apply (including the
+        # rotated file it rejects while the pin in memory is still the old one), so this is a backstop; the
+        # reload runs the normal restriction and cancellation checks.
+        self.cfg_mtime = _UNSET
         self._retired[old.key_id] = (old.pubkey, self.d.clock() + RETIRED_KEY_MS)
         log.info("server key rotated %s -> %s", old.key_id, b["new_key_id"])
         await self._send("ack", {}, re=f.id)
@@ -738,49 +802,167 @@ class Daemon:
         for lane in (self.build, self.light):
             await lane.cancel_matching(lambda j: True, reason="revoked")
         keyfile.delete_device_key(self.home)
-        cfg = config.load(self.home)
-        config.save(self.home, replace(cfg, server=None))
+        try:
+            await asyncio.to_thread(config.update, self.home, lambda cfg: replace(cfg, server=None))
+        except (ConfigError, keyfile.UnsafeKeyStorage, OSError) as e:
+            log.error("unpaired by the server and the device key is deleted, but the server pin in config.toml "
+                      "could not be cleared (%s); run 'bh unpair' to finish", e)
 
     # ------------------------------------------------------------ config watcher (SPEC 8.3)
-    async def _watch(self) -> None:
-        last_probe = last_prune = time.monotonic()
-        while True:
-            await asyncio.sleep(self.d.config_poll_s)
+    # Every poll runs each step below on its own: a step that fails never skips another one.
+    #  1. Owner cancels (`bh cancel`): retried every poll until a cancel call for that job has completed.
+    #  2. Config version: cfg_mtime is the version of config.toml fully applied, i.e. read, its server pin the
+    #     one in memory, published as self.cfg, probed, and every job it no longer allows stopped by a cancel
+    #     call that completed. Short of that it stays pending and the next poll retries all of it. A version
+    #     that cannot be read, or carries another pin, is never published: the last good config stays in use.
+    #  3. Capability refresh: every probe_refresh_s, pending or rejected version or not. A failed probe keeps
+    #     the previous probes and is retried on the next poll.
+    #  4. Caps to the server: checked every poll, sent only when the body changed. The only forced send is the
+    #     first frame of each session (_on_session); the server never asks for an unchanged resend.
+    #  5. Logging: a rejected version once per version. A failing probe, cancel or step once per distinct
+    #     error, and once when it works again. Retrying never stops.
+    def _failed(self, key, what: str, e: BaseException) -> None:
+        text = f"{type(e).__name__}: {e}"
+        if self._failures.get(key) != text:
+            self._failures[key] = text
+            log.error("%s: %s", what, text, exc_info=(type(e), e, e.__traceback__))
+
+    def _works_again(self, key, what: str) -> None:
+        if self._failures.pop(key, None) is not None:
+            log.info("%s works again", what)
+
+    async def _cancel_once(self, job_id: str, reason: str, lane=None) -> bool:
+        """One cancel attempt. True once a cancel call for this job has completed (then it is not retried)."""
+        if job_id in self._cancel_done:
+            return True
+        what = f"cancel of job {job_id[:8]}"
+        try:
+            if lane is not None:
+                await lane.cancel(job_id, reason)
+            else:
+                await self._cancel_job(job_id, reason)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._failed(("cancel", job_id), f"{what} failed (retrying)", e)
+            return False
+        self._works_again(("cancel", job_id), what.replace("cancel of", "cancel works again for"))
+        self._cancel_done.add(job_id)
+        return True
+
+    async def _apply_config(self) -> bool:
+        """Step 2. Returns True when a version was applied in this poll."""
+        m = config.mtime(self.home)
+        if m == self.cfg_mtime:
+            return False
+        try:
+            new = config.load(self.home)
+        except (ConfigError, keyfile.UnsafeKeyStorage, OSError) as e:
+            if m != self._rejected_mtime:
+                self._rejected_mtime = m
+                log.error("config.toml is invalid, keeping the previous one: %s", e)
+                self._set_status(self._status["state"], f"config error: {e}")
+            return False
+        if new.server != self.cfg.server:
+            # The rotation's own write, seen before its pin is in memory: retried. Only that pin is skipped; a
+            # removed [server] is never excused, however many rotation frames the server sends.
+            if self._rotating is not None and new.server == self._rotating:
+                self._rejected_mtime = m
+                return False
+            await self._pairing_gone(new.server is None)
+            return False
+        self.cfg = new
+        # Stop what this version no longer allows before the probe (which can take a while), and again after it:
+        # fresh probes can disable more.
+        stopped = await self._stop_disallowed()
+        probed = await self._refresh_probes()
+        stopped = await self._stop_disallowed() and stopped
+        if not (probed and stopped):
+            return False
+        self.cfg_mtime, self._rejected_mtime = m, _UNSET
+        return True
+
+    async def _stop_disallowed(self) -> bool:
+        """Cancel every queued or running job the config in memory no longer allows. True when every cancel call
+        has completed."""
+        stopped = True
+        for lane in (self.build, self.light):
+            # the running job first: its cancel needs no send, a queued job's report can wait on the connection
+            jobs = ([lane.q.active] if lane.q.active is not None else []) + lane.q.queued()
+            for j in jobs:
+                why = self._still_allowed(j)
+                if why is not None:
+                    stopped = await self._cancel_once(j.job_id, why, lane) and stopped
+        return stopped
+
+    async def _pairing_gone(self, unpaired: bool) -> None:
+        """config.toml has no [server], or another one, while this helper still holds the old pin and key in
+        memory (bh unpair under a helper that kept running, a deleted file, a hand edit). Fail closed: cancel every
+        job as revoked, drop the key and stop. The file is the owner's and is not rewritten. Exit 3 when the Mac
+        is unpaired (as "unpaired by server"), 1 when the file names another server (a restart loads it)."""
+        if self._halt.is_set():
+            return
+        log.error("config.toml no longer names the server this helper is paired with (%s); cancelling its jobs "
+                  "and stopping", "this Mac is unpaired" if unpaired else "the [server] section changed")
+        self._halt_code = 3 if unpaired else 1
+        self.priv = None
+        self._set_status("stopped", "this Mac was unpaired" if unpaired else "config.toml names another server")
+        self._halt.set()                 # before the cancels: a failing cancel must not keep the session open
+        for lane in (self.build, self.light):
             try:
-                for jid in self.store.cancel_requests():
-                    if jid not in self._cancel_reason:
-                        await self._cancel_job(jid, "cancelled_on_mac")
-                if time.monotonic() - last_prune > self.d.prune_every_s:
-                    self.store.prune(self.d.clock())
-                    last_prune = time.monotonic()
-                m = config.mtime(self.home)
-                changed = m != self.cfg_mtime
-                if changed:
-                    self.cfg_mtime = m
-                    try:
-                        new = config.load(self.home)
-                    except (ConfigError, keyfile.UnsafeKeyStorage) as e:
-                        log.error("config.toml is invalid, keeping the previous one: %s", e)
-                        self._set_status(self._status["state"], f"config error: {e}")
-                        new = None
-                    if new is not None and new.server == self.cfg.server:
-                        self.cfg = new
-                        self.probes = await self._probe()
-                        last_probe = time.monotonic()
-                        for lane in (self.build, self.light):
-                            jobs = lane.q.queued() + ([lane.q.active] if lane.q.active is not None else [])
-                            for j in jobs:
-                                why = self._still_allowed(j)
-                                if why is not None and j.job_id not in self._cancel_reason:
-                                    await lane.cancel(j.job_id, why)
-                    elif new is not None:
-                        log.error("config.toml [server] changed under a running daemon; restart it")
-                elif time.monotonic() - last_probe > self.d.probe_refresh_s:
-                    self.probes = await self._probe()
-                    last_probe = time.monotonic()
-                if self.session is not None:
-                    await self._send_caps(force=changed)
+                await lane.cancel_matching(lambda j: True, reason="revoked")
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("config watcher")
+                log.exception("cancel while stopping after the pairing was removed")
+
+    async def _refresh_probes(self) -> bool:
+        try:
+            self.probes = await self._probe()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._failed("probe", "capability probe failed (retrying)", e)
+            return False
+        self._last_probe = time.monotonic()
+        self._works_again("probe", "capability probe")
+        return True
+
+    async def _watch(self) -> None:
+        self._last_probe = last_prune = time.monotonic()
+        while True:
+            await asyncio.sleep(self.d.config_poll_s)
+
+            async def step(name, run):
+                try:
+                    out = await run()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self._failed(("step", name), f"config watcher: {name} failed (retrying)", e)
+                    return None
+                self._works_again(("step", name), f"config watcher: {name}")
+                return out
+
+            async def owner_cancels():
+                live = {j for j in self._cancel_done if (r := self.store.get(j)) is not None and not r.terminal}
+                self._cancel_done.intersection_update(live)
+                for jid in self.store.cancel_requests():
+                    await self._cancel_once(jid, "cancelled_on_mac")
+
+            async def prune():
+                nonlocal last_prune
+                if time.monotonic() - last_prune > self.d.prune_every_s:
+                    self.store.prune(self.d.clock())
+                    last_prune = time.monotonic()
+
+            async def refresh():
+                if time.monotonic() - self._last_probe > self.d.probe_refresh_s:
+                    await self._refresh_probes()
+
+            await step("owner cancels", owner_cancels)
+            await step("prune", prune)
+            await step("config", self._apply_config)
+            await step("capability refresh", refresh)
+            if self.session is not None:
+                await step("caps", self._send_caps)       # only a changed body; each session's first is forced

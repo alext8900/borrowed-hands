@@ -31,8 +31,16 @@ def _ask(prompt: str) -> str:
 
 
 def _sudo(argv: list[str]) -> int:
-    """Run one admin command interactively (sudo may ask for the password). The caller has already shown it."""
-    return subprocess.run(["/usr/bin/sudo", *argv]).returncode
+    """Run one admin command interactively (sudo may ask for the password). The caller has already shown it.
+    On Ctrl-C, wait for sudo instead of killing it (subprocess.run would, after 0.25 s): a sudo running its command
+    is root, so the kill fails with PermissionError and hides the KeyboardInterrupt from the caller's handler. sudo
+    gets the same SIGINT from the terminal and ends on its own; then the interrupt is raised again."""
+    p = subprocess.Popen(["/usr/bin/sudo", *argv])
+    try:
+        return p.wait()
+    except KeyboardInterrupt:
+        p.wait()
+        raise
 
 
 def path_state(p: str) -> Optional[bool]:

@@ -103,3 +103,41 @@ def test_lane_drop_matching_cancels_queued_and_running():
 
     run(main())
     assert ("drop", "b", "grant_revoked") in events and ("cancel_running", "a") in events
+
+
+def test_cancel_matching_stops_the_running_job_even_when_reporting_a_queued_one_never_returns():
+    """Security review round 3, S1: dropping a queued job reports to the server, and a server that stops reading
+    its socket holds that report. The running job's cancel reaches only the executor, so it goes first, and no
+    queued job is started in its place while the cancels are under way."""
+    events = []
+
+    async def main():
+        gate = asyncio.Event()
+
+        async def run_job(job):
+            events.append(("start", job.job_id))
+            await gate.wait()
+
+        async def dropped(job, state, error):
+            events.append(("drop", job.job_id))
+            await asyncio.sleep(3600)                  # the report that never gets through
+
+        async def cancel_running(job_id, reason=None):
+            events.append(("cancel_running", job_id))
+            gate.set()
+
+        lane = Lane("build", run_job=run_job, recheck=lambda j: None, on_drop=dropped,
+                    cancel_running=cancel_running)
+        task = asyncio.create_task(lane.run())
+        lane.submit(Job("a"))
+        lane.submit(Job("b"))
+        lane.submit(Job("c"))
+        await asyncio.sleep(0.01)
+        stuck = asyncio.create_task(lane.cancel_matching(lambda j: True, reason="revoked"))
+        await asyncio.sleep(0.2)
+        assert not stuck.done()
+        assert events == [("start", "a"), ("cancel_running", "a"), ("drop", "b")]      # b and c never started
+        stuck.cancel()
+        task.cancel()
+
+    run(main())

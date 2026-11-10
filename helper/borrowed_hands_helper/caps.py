@@ -76,9 +76,37 @@ def _root_owned_file(p: Path, root_uid: int) -> Optional[str]:
     return None
 
 
-def production_install(prefix: Path = PREFIX, root_uid: int = 0, check_parents: bool = True) -> InstallStatus:
+BUILDER, BUILDER_ID = "bh-builder", 470
+BUILDER_MISSING = ("the build user bh-builder is missing (an uninstall's 'administer your computer' prompt answered "
+                   "after the command ended deletes it): run 'bh uninstall', then 'bh setup'")
+
+
+def builder_account_problem(getpwnam: Callable = None, getgrnam: Callable = None) -> Optional[str]:
+    """None if the build user exists with uid and gid 470 and the build group with gid 470 (the LaunchDaemon names
+    both); otherwise why not. A lookup that fails counts as missing: the dispatcher alone is never a ready install."""
+    import grp
+    import pwd
+    try:
+        pw = (getpwnam or pwd.getpwnam)(BUILDER)
+    except KeyError:
+        return BUILDER_MISSING
+    if (pw.pw_uid, pw.pw_gid) != (BUILDER_ID, BUILDER_ID):
+        return (f"the account bh-builder is {pw.pw_uid}:{pw.pw_gid}, not the Borrowed Hands build user "
+                f"({BUILDER_ID}:{BUILDER_ID}); see docs/QUICKSTART.md, Uninstall")
+    try:
+        gr = (getgrnam or grp.getgrnam)(BUILDER)
+    except KeyError:
+        return "the build group bh-builder is missing: run 'bh uninstall', then 'bh setup'"
+    if gr.gr_gid != BUILDER_ID:
+        return f"the group bh-builder has gid {gr.gr_gid}, not {BUILDER_ID}; see docs/QUICKSTART.md, Uninstall"
+    return None
+
+
+def production_install(prefix: Path = PREFIX, root_uid: int = 0, check_parents: bool = True,
+                       account: Callable[[], Optional[str]] = builder_account_problem) -> InstallStatus:
     """The production gate: a root-owned, non-writable dispatcher (and its directories), no TEST_MODE,
-    and no test profiles. The helper never trusts /opt/borrowed-hands files it did not check here."""
+    no test profiles, and the build user it runs builds as. The helper never trusts /opt/borrowed-hands files it
+    did not check here."""
     prefix = Path(prefix)
     problems = []
     dispatcher = prefix / "bin" / "bh-dispatch"
@@ -102,6 +130,9 @@ def production_install(prefix: Path = PREFIX, root_uid: int = 0, check_parents: 
     if extra:
         problems.append(f"test sandbox profiles are installed in {prof}: run 'sudo bash {SANDBOX}/"
                         f"setup-bh-builder.sh' with no flags")
+    why = account()
+    if why:
+        problems.append(why)
     return InstallStatus(not problems, tuple(problems))
 
 

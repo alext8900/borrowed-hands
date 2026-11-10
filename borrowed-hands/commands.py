@@ -1,23 +1,30 @@
-"""/hands pair | status | unpair <helper> | rotate-key | help (SPEC 8.2).
+"""/hands pair | status (doctor) | whoami | unpair <helper> | rotate-key | help (SPEC 8.2).
 
 Owner gate: the local CLI (source None) or `platform:user_id` in settings.owners. `pair` also needs a DM, because
-the pairing string is a secret for 10 minutes.
+the pairing string is a secret for 10 minutes. `whoami` is the one command a non-owner gets an answer from: in a
+DM it shows the sender's own `platform:user_id`, and it changes nothing.
 """
 from __future__ import annotations
 
 import contextvars
 import logging
+import re
 import time
 from typing import Any, Optional
 
 from . import pairing, runtime
 
 log = logging.getLogger("borrowed_hands")
+# What /hands whoami echoes back: narrower than the owners setting, so no chat markup or control character from a
+# platform's user id reaches the reply.
+_WHOAMI_RE = re.compile(r"[a-z0-9_]{1,32}:[A-Za-z0-9_.@+-]{1,128}\Z")
 
 USAGE = ("Borrowed Hands: `/hands pair` (in a DM) gives a one-time pairing string for your Mac; `/hands status` "
-         "shows what is connected; `/hands unpair <name or id>` removes a Mac; `/hands rotate-key` is not "
-         "available in 0.1.")
+         "(or `/hands doctor`) shows what is connected and what to fix; `/hands whoami` (in a DM) shows the id to "
+         "put in owners; `/hands unpair <name or id>` removes a Mac; `/hands rotate-key` is not available in this version.")
 NOT_OWNER = "Only the Borrowed Hands owner can do that."
+NO_OWNER = ("No owner is configured, so nobody can use /hands from chat yet. Run `/hands whoami` in a direct message "
+            "with me to see what to set.")
 
 
 def _now() -> int:
@@ -37,20 +44,40 @@ def handle(raw_args: str, source: Any = None, **_) -> Optional[str]:
         return USAGE
     if rt is None:
         return "Borrowed Hands did not load; check the gateway log for borrowed_hands lines."
+    if sub == "whoami":                  # before the owner check: it grants nothing and shows only the caller's own id
+        return _whoami(rt, source)
     if source is not None and not rt.settings.is_owner(_platform(source), getattr(source, "user_id", None)):
-        return NOT_OWNER
+        return NOT_OWNER if rt.settings.owners else NO_OWNER
     if sub == "pair":
         return _pair(rt, source)
-    if sub == "status":
+    if sub in ("status", "doctor"):
         return status_text(rt)
     if sub == "unpair":
         return _unpair(rt, " ".join(parts[1:]).strip())
     if sub == "rotate-key":
-        return ("Server key rotation is not available in 0.1. If you think the server key leaked: run `bh unpair` "
+        return ("Server key rotation is not available in this version. If you think the server key leaked: run `bh unpair` "
                 "on every Mac first, then stop the gateway, rename this plugin's directory under "
                 "$HERMES_HOME/plugin-data (that keeps the audit log), start the gateway, and pair each Mac again "
                 "with /hands pair and `bh setup`.")
     return USAGE
+
+
+def _whoami(rt, source) -> str:
+    """The `platform:user_id` this chat's sender would be as an owner. It changes nothing: becoming an owner still
+    takes an edit of this Hermes's settings and a restart, by whoever runs it."""
+    if source is None:
+        return "You are the local operator of this Hermes (local:cli)."
+    if getattr(source, "chat_type", None) != "dm":
+        return "Run /hands whoami in a direct message with me."
+    platform, user = _platform(source), getattr(source, "user_id", None)
+    me = f"{platform}:{user}"
+    if not isinstance(platform, str) or not isinstance(user, str) or not _WHOAMI_RE.match(me):
+        return "I cannot show who you are on this platform: the id is missing or has characters I do not echo."
+    if rt.settings.is_owner(platform, user):
+        return f"You are `{me}`, an owner of Borrowed Hands on this Hermes."
+    return (f"You are `{me}`. You are not an owner of Borrowed Hands on this Hermes. Whoever runs it can make you "
+            f"one: add `{me}` to plugins.entries.borrowed-hands.settings.owners in config.yaml (or to BH_OWNERS) "
+            "and restart the gateway.")
 
 
 def _pair(rt, source) -> Optional[str]:

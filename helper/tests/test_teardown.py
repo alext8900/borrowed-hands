@@ -76,23 +76,28 @@ rmdir() {
 dscl_base() {
   # dscl . -read <path> [attr] | -list <dir> <attr> | -delete <path>
   case "$2" in
-    -read) [ -f "$T/ds$3" ] || return 56
+    -read) [ -f "$T/ds$3" ] || { echo "<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)" >&2; return 56; }
            if [ $# -ge 4 ]; then grep "^$4: " "$T/ds$3" || return 56; else cat "$T/ds$3"; fi ;;
     -list) [ -f "$T/listfail" ] && return 70
            for f in "$T/ds$3"/*; do [ -f "$f" ] || continue
+             [ -f "$T/listhide" ] && [ "$f" = "$T/ds/Users/bh-builder" ] && continue   # a listing that omits it
              printf '%s %s\n' "$(basename "$f")" "$(sed -n "s/^$4: //p" "$f")"; done ;;
-    -delete) log "dscl-delete $3"
-             case "$3" in /Users/*)
-               case $(nextof delete) in
+    -delete) log "dscl-delete $3"; echo "[dscl -delete $3]"
+             local seq=delete; case "$3" in /Groups/*) seq=gdelete ;; esac
+               case $(nextof $seq) in
                  hang) exec /bin/sleep 30 ;;          # only ever run in the background by the bounded delete
                  hangshort) exec /bin/sleep 2 ;;      # for tests where nothing may kill it
+                 # Don't Allow: what dscl really returns is unverified; any quick failure must be handled alike
+                 denied) echo "<dscl_cmd> DS Error: -14120 (eDSPermissionError)" >&2; return 14 ;;
                  # opendirectoryd finished the delete although dscl hung or failed (the record is gone)
                  hangdel) /bin/rm -f "$T/ds$3"; exec /bin/sleep 30 ;;
                  errdel) /bin/rm -f "$T/ds$3"; echo "<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)" >&2; return 1 ;;
                  errdel_listfail) /bin/rm -f "$T/ds$3"; : > "$T/listfail"; return 1 ;;
                  err) echo "<dscl_cmd> DS Error: -14987 (eUndefinedError)" >&2; return 1 ;;
+                 okkeep) return 0 ;;                  # exit 0, but the record is still there
+                 ok_listfail) /bin/rm -f "$T/ds$3"; : > "$T/listfail"; return 0 ;;   # exit 0, then no listing
+                 *) /bin/rm -f "$T/ds$3" ;;           # ok: the record is really gone
                esac ;;
-             esac ;;
   esac
 }
 dscl() { dscl_base "$@"; }
@@ -100,7 +105,7 @@ dscl() { dscl_base "$@"; }
 
 
 def make_tree(t: Path, folders=None, unlistable=(), full=None, lserr=None, fstype="apfs",
-              rmdir="Operation not permitted", users=(), groups=(), deletes=(), pgreps=(), gui=False, ppid=None):
+              rmdir="Operation not permitted", users=(), groups=(), deletes=(), pgreps=(), gui=False, ppid=None, gdeletes=(), listhide=False):
     """The fake world the stubs read. folders: what is left of uid 470 under /private/var/folders after the
     removal, {path: lstat answer}: the '%HT:%u:%f' text, EPERM (the kernel refuses even root a stat: a SIP data
     vault) or MISSING (listed, but the stat fails some other way). Depth-two paths are what the second `find`
@@ -112,9 +117,12 @@ def make_tree(t: Path, folders=None, unlistable=(), full=None, lserr=None, fstyp
     pgreps: each `pgrep -U 470` in turn: "none", "found" or "error"; gui: a gui/470 launchd domain exists.
     ppid: what `ps -o ppid=` answers instead of the truth (the delete's pid now belongs to someone else)."""
     (t).mkdir(parents=True, exist_ok=True)
+    if listhide:
+        (t / "listhide").write_text("")
     if ppid is not None:
         (t / "ppid").write_text(ppid + "\n")
     (t / "delete").write_text("".join(d + "\n" for d in deletes))
+    (t / "gdelete").write_text("".join(d + "\n" for d in gdeletes))      # the same answers, for /Groups deletes
     (t / "pgrep").write_text("".join(d + "\n" for d in pgreps))
     if gui:
         (t / "gui").write_text("")
@@ -223,7 +231,7 @@ def test_rerun_after_partial_teardown_removes_an_orphaned_home_but_not_caches(tm
     # caches are only removed while the account itself is verified ours
     rc, log, out, home, _ = run_teardown(tmp_path, home_stat="Directory:470:470")
     assert rc == 0, out + log
-    assert f"rm -rf {home}" in log and CACHES not in log
+    assert f"rm -rf {home}" in log and f"{CACHES} -prune -exec rm -rf" not in log     # checked (below), never removed
 
 
 def test_sweep_failure_still_refuses_to_delete_the_user(tmp_path):
@@ -516,7 +524,7 @@ def test_the_read_only_check_never_removes_anything(tmp_path):
 # the first `dscl -create` ends the run with 99 (= the preflight let the install go ahead).
 SETUP = SANDBOX / "setup-bh-builder.sh"
 SETUP_STUBS = r'''
-dscl() { case "$2" in -create) log "dscl-create $3 ${4:-}"; exit 99 ;; *) dscl_base "$@" ;; esac; }
+dscl() { case "$2" in -create) log "dscl-create $3 ${4:-}"; echo "[dscl -create $3]"; exit 99 ;; *) dscl_base "$@" ;; esac; }
 mkdir() { log "mkdir $*"; exit 98; }
 chown() { log "chown $*"; exit 98; }
 install() { log "install $*"; exit 98; }
@@ -659,10 +667,10 @@ def test_setup_never_sets_a_generated_uid():
 # ---- round 3, a real Mac (macOS 27.2, 2026-11-09): the TemporaryItems proof passed as root (stat read exactly
 # Directory:470:470:40700:0:64:2, ls failed with exactly "ls: <path>: Operation not permitted"), but
 # `dscl . -delete /Users/bh-builder` hung twice: opendirectoryd logged "ODRecordDelete ... active for 310 seconds,
-# forcing a timeout", then ODErrorPluginOperationTimeout and DS Error -14987 (eUndefinedError). Observed, cause not
-# proven: a uid-470 `distnoted agent` started the second the delete began and launchd respawned it after a kill;
-# with uid 470's processes stopped a bounded delete finished in 37 s. So, after the identity fence only: boot out
-# uid 470's launchd domains, kill its processes, confirm none remain, then delete with a time limit, retry once.
+# forcing a timeout", then ODErrorPluginOperationTimeout and DS Error -14987 (eUndefinedError). The cause, found
+# later, is macOS's unanswered "administer your computer" prompt (see the TCC tests below), not a uid-470 process.
+# After the identity fence only: boot out uid 470's launchd domains, kill its processes, confirm none remain (no
+# build process outlives the account), then delete with a time limit, retry once.
 FAST = "DELETE_TIMEOUT=50"               # 50 stub seconds = 1 s
 USER_DELETE = "dscl-delete /Users/bh-builder"
 
@@ -711,6 +719,8 @@ def test_a_delete_that_times_out_or_fails_is_retried_once_after_stopping_process
     d1, d2 = lines(log, USER_DELETE)
     assert [i for i in lines(log, "pkill -KILL -U 470") if d1 < i < d2], log      # stopped again in between
     assert [i for i in lines(log, "launchctl bootout user/470") if d1 < i < d2], log
+    retry = next(l for l in out.splitlines() if "retrying once" in l)
+    assert "administer your computer" in retry and "Allow" in retry and "still open" in retry, retry
     assert "retrying once" in out and ("did not finish within 50 s" in out if first == "hang" else "exit 1" in out), out
     assert f"rm -rf {home}" in log and f"rm -rf {prefix}" in log
 
@@ -719,7 +729,17 @@ def test_a_delete_that_times_out_or_fails_is_retried_once_after_stopping_process
 def test_a_second_failed_delete_fails_closed_naming_opendirectoryd(tmp_path, deletes):
     rc, log, out, home, prefix = ours(tmp_path, extra=FAST, deletes=deletes)
     assert rc == 1 and len(lines(log, USER_DELETE)) == 2, out + log
-    assert "opendirectoryd" in out and "-14987" in out and "distnoted" in out, out
+    msg = next(l for l in out.splitlines() if l.startswith("could not delete user bh-builder, twice"))
+    # the proven cause first: the administer-your-computer prompt went unanswered
+    assert "administer your computer" in msg and "process == \"tccd\"" in msg, msg
+    # Security review round 1 F1: neither the kill nor opendirectoryd's timeout cancels the request: the prompt stays open and
+    # Allow deletes the account whenever it is clicked. The safe order is rerun first, then click while it waits.
+    assert ("is still open" in msg or "may still be open" in msg) and "at that moment" in msg, msg
+    assert "run 'bh uninstall' again first" in msg and "click Allow while it waits" in msg, msg
+    assert "then gives up" not in msg and "-14987" not in msg, msg
+    assert "Don't Allow" in msg and "not observed" in msg, msg
+    assert "process == \"tccd\"" in msg and "SysAdminFiles" in msg, msg     # the log hint looks at tccd
+    assert "distnoted" not in out, out
     assert "kept user bh-builder and" in out and "bh uninstall" in out, out
     assert "removed bh-builder" not in out and "could not delete user bh-builder, twice (" in out, out
     assert "could not delete user bh-builder\n" not in out, out                  # never the old generic line
@@ -785,3 +805,307 @@ def test_bounded_never_prints_a_job_notice_under_repetition(tmp_path):
                                       "bounded 1 /bin/sleep 5; echo rc=$?; done")[2]
     assert out.count("rc=124") == 20, out
     assert "Killed" not in out and "Terminated" not in out, out
+
+
+# ---- 2026-11-09, root cause of the account-delete hang (real Mac, unified log at the second of the delete):
+# tccd AUTHREQ_PROMPTING service=kTCCServiceSystemPolicySysAdminFiles, subject = the app running the terminal
+# (here T3 Code), and UserNotificationCenter took focus: macOS asked '"<app>" would like to administer your
+# computer' and opendirectoryd held the delete until someone answered. Unanswered, it timed out, even with no uid-470
+# process running. So warn before each directory change, and name that cause when it fails.
+ADMIN_PROMPT = "administer your computer"
+
+
+def _before(out, needle, marker):
+    o = out.splitlines()
+    first = next(i for i, l in enumerate(o) if needle in l)
+    return first < next(i for i, l in enumerate(o) if l.startswith(marker))
+
+
+def test_the_admin_prompt_is_announced_before_the_user_delete(tmp_path):
+    rc, log, out, _, _ = ours(tmp_path, extra=FAST)
+    assert rc == 0, out + log
+    assert _before(out, ADMIN_PROMPT, "[dscl -delete /Users/bh-builder]"), out
+    assert "Allow" in next(l for l in out.splitlines() if ADMIN_PROMPT in l), out
+    assert out.count(ADMIN_PROMPT) == 1, out                          # once, not again for the group
+
+
+def test_the_admin_prompt_is_announced_before_a_lone_group_delete(tmp_path):
+    # the account is already gone (a partial earlier run): the group delete is the first directory change
+    rc, log, out, _, _ = run_teardown(tmp_path, groups=[("bh-builder", "470")], home_stat="Directory:470:470")
+    assert rc == 0 and _before(out, ADMIN_PROMPT, "[dscl -delete /Groups/bh-builder]"), out + log
+
+
+def test_no_admin_prompt_notice_when_nothing_in_the_directory_changes(tmp_path):
+    rc, log, out, _, _ = run_teardown(tmp_path, users=[("alice", ALICE)], home_stat="Directory:470:470")
+    assert rc == 1 and ADMIN_PROMPT not in out, out
+
+
+def test_setup_warns_that_an_admin_prompt_during_setup_is_a_leftover_delete(tmp_path):
+    # Security review round 1 F4b: creating the account was never seen to prompt; the log shows no SysAdminFiles request there.
+    # A prompt on screen during setup is most likely an earlier uninstall's delete, which Allow would carry out.
+    rc, log, out = run_setup(tmp_path)
+    assert rc == 99 and _before(out, ADMIN_PROMPT, "[dscl -create /Groups/bh-builder]"), out + log
+    line = next(l for l in out.splitlines() if ADMIN_PROMPT in l)
+    assert "Click Allow" not in line and "earlier 'bh uninstall'" in line and "do not click Allow" in line, line
+    assert "not been seen" in line, line
+
+
+def test_the_delete_bound_leaves_a_person_time_to_answer_but_ends_before_opendirectoryd(tmp_path):
+    # a person has to notice the prompt and click; opendirectoryd gives up by itself after about 310 s (seen twice)
+    out = run_teardown(tmp_path, main='echo "$DELETE_TIMEOUT"')[2]
+    assert 240 <= int(out) < 310, out
+
+
+def test_no_document_blames_distnoted_for_the_delete_hang():
+    # the hang recurred with no uid-470 process left; the proven cause is the unanswered TCC prompt
+    from borrowed_hands_helper._shared import ROOT
+    assert "distnoted" not in SCRIPT.read_text()
+    quick = (ROOT / "docs/QUICKSTART.md").read_text()
+    assert "distnoted" not in quick and "kTCCServiceSystemPolicySysAdminFiles" in quick
+    sandbox = (ROOT / "docs/SANDBOX.md").read_text()
+    assert "otherwise stalled the delete" not in sandbox and "administer your computer" in sandbox
+
+
+# ---- Don't Allow: what dscl returns after a denied prompt is unverified (nobody could click it here). Any non-zero
+# exit, fast or slow, must end the same way: one retry, then fail closed naming the prompt, account kept.
+def test_a_denied_prompt_fails_closed_with_the_prompt_message(tmp_path):
+    rc, log, out, home, prefix = ours(tmp_path, extra=FAST, deletes=["denied", "denied"])
+    assert rc == 1 and len(lines(log, USER_DELETE)) == 2, out + log
+    msg = next(l for l in out.splitlines() if l.startswith("could not delete user bh-builder, twice"))
+    assert "dscl exit 14" in msg and "Don't Allow" in msg and "click Allow" in msg, msg
+    assert "no longer listed" not in out and f"rm -rf {prefix}" not in log and f"rm -rf {home}" not in log, log
+
+
+def test_a_denial_then_an_allowed_retry_completes(tmp_path):
+    rc, log, out, _, _ = ours(tmp_path, extra=FAST, deletes=["denied", "ok"])
+    assert rc == 0 and "removed bh-builder" in out and len(lines(log, USER_DELETE)) == 2, out + log
+
+
+def test_the_docs_say_the_prompt_stays_armed_and_give_the_safe_order():
+    from borrowed_hands_helper._shared import ROOT
+    quick = (ROOT / "docs/QUICKSTART.md").read_text()
+    for text in (quick, SCRIPT.read_text()):
+        assert "then gives up" not in text
+    flat = " ".join(quick.split())
+    assert "still open" in flat and "run `bh uninstall` again first" in flat and "while it waits" in flat
+
+
+# ---- Security review round 1 F2: after a late Allow the account is gone and the group, home and dispatcher are left, so the
+# rerun lands in the "account already gone" branch. It must check what it can without the account (uid 470's
+# processes, its per-user folders, read-only) so that exit 0 always means "checked"; bh uninstall relies on that.
+ORPHAN = dict(groups=[("bh-builder", "470")], home_stat="Directory:470:470", extra=FAST)
+TI_OK = {TI: EMPTY_TI, TTI: EMPTY_TI}
+
+
+def test_an_orphaned_install_is_swept_and_checked_before_anything_is_removed(tmp_path):
+    rc, log, out, home, prefix = run_teardown(tmp_path, folders=REAL_SKELETON, full=TI_OK, **ORPHAN)
+    assert rc == 0 and "removed bh-builder" in out, out + log
+    first_removal = lines(log, "dscl-delete /Groups/bh-builder")[0]
+    for step in ("launchctl bootout user/470", "pkill -KILL -U 470", "pgrep -U 470", CACHES, f"ls -1Ab {SKEL}"):
+        assert lines(log, step) and lines(log, step)[0] < first_removal, (step, log)
+    assert f"{CACHES} -prune -exec rm -rf" not in log and "rmdir" not in log, log      # read-only without the account
+    assert f"rm -rf {home}" in log and f"rm -rf {prefix}" in log
+    assert "left by macOS" in out and SKEL in out, out
+
+
+def test_an_orphaned_install_with_lingering_processes_removes_nothing(tmp_path):
+    rc, log, out, home, prefix = run_teardown(tmp_path, folders=REAL_SKELETON, full=TI_OK, pgreps=["found"] * 30,
+                                              **ORPHAN)
+    assert rc == 1 and "uid 470" in out, out + log
+    assert "dscl-delete" not in log and f"rm -rf {home}" not in log and f"rm -rf {prefix}" not in log, log
+
+
+@pytest.mark.parametrize("left", [{f"{SKEL}/C/build.db": "Regular File:470:0"}, {SKEL: "Directory:470:0"}])
+def test_an_orphaned_install_whose_folders_are_not_verifiably_empty_exits_3(tmp_path, left):
+    # the group, home and dispatcher are still ours to remove; the folders are not (no account to vouch for them),
+    # and exit 3 tells bh uninstall that they were checked and are not clean
+    rc, log, out, home, prefix = run_teardown(tmp_path, folders={**REAL_SKELETON, **left}, full=TI_OK, **ORPHAN)
+    from borrowed_hands_helper.cli import ORPHAN_FOLDERS_RC
+    assert rc == ORPHAN_FOLDERS_RC == 3, out + log
+    assert "dscl-delete /Groups/bh-builder" in log and f"rm -rf {home}" in log and f"rm -rf {prefix}" in log, log
+    assert "removed bh-builder" not in out and "bh setup" in out and "already gone" in out, out
+    assert f"{CACHES} -prune -exec rm -rf" not in log, log
+
+
+def test_every_exit_0_has_looked_at_uid_470s_folders(tmp_path):
+    cases = [dict(users=[("bh-builder", OURS_USER)], groups=[("bh-builder", "470")], home_stat="Directory:470:470",
+                  extra=FAST), ORPHAN, dict(extra=FAST)]
+    for i, kw in enumerate(cases):
+        rc, log, out, _, _ = run_teardown(tmp_path / str(i), folders=REAL_SKELETON, full=TI_OK, **kw)
+        assert rc == 0 and lines(log, CACHES) and lines(log, "pgrep -U 470"), (i, out + log)
+
+
+# ---- Security review round 1 F5: what dscl's exit code means after Don't Allow was never observed; never believe an exit 0
+# without a working listing that no longer shows the account
+def test_an_exit_0_with_the_account_still_listed_is_a_failed_attempt(tmp_path):
+    rc, log, out, _, _ = ours(tmp_path, extra=FAST, deletes=["okkeep", "ok"])
+    assert rc == 0 and len(lines(log, USER_DELETE)) == 2, out + log
+    assert "still listed" in out, out
+
+
+def test_two_exit_0s_with_the_account_still_listed_fail_closed(tmp_path):
+    rc, log, out, home, prefix = ours(tmp_path, extra=FAST, deletes=["okkeep", "okkeep"])
+    assert rc == 1 and "removed bh-builder" not in out and "still listed" in out, out + log
+    assert "dscl-delete /Groups/bh-builder" not in log and f"rm -rf {prefix}" not in log, log
+    assert f"rm -rf {home}" not in log, log
+
+
+def test_an_exit_0_followed_by_a_failed_listing_is_not_believed(tmp_path):
+    rc, log, out, home, prefix = ours(tmp_path, extra=FAST, deletes=["ok_listfail", "ok"])
+    assert rc == 1 and len(lines(log, USER_DELETE)) == 2 and "removed bh-builder" not in out, out + log
+    assert f"rm -rf {prefix}" not in log and f"rm -rf {home}" not in log, log
+
+
+# ---- Security review round 1 F4c: a lone group delete is the first directory change after a late Allow; whether it prompts was
+# not observed, so it gets the same bound, listing check and one retry as the user delete
+GROUP_DELETE = "dscl-delete /Groups/bh-builder"
+
+
+def test_a_hung_group_delete_is_bounded_and_retried(tmp_path):
+    import time
+    t0 = time.monotonic()
+    rc, log, out, _, _ = run_teardown(tmp_path, gdeletes=["hang", "ok"], **ORPHAN)
+    assert time.monotonic() - t0 < 20, "the hung group delete was not bounded"
+    assert rc == 0 and len(lines(log, GROUP_DELETE)) == 2 and lines(log, "kill -KILL"), out + log
+
+
+@pytest.mark.parametrize("gdeletes", [["hang", "hang"], ["err", "err"], ["okkeep", "okkeep"]])
+def test_a_group_delete_that_fails_twice_fails_closed_with_the_prompt_message(tmp_path, gdeletes):
+    rc, log, out, _, _ = run_teardown(tmp_path, gdeletes=gdeletes, **ORPHAN)
+    assert rc == 1 and len(lines(log, GROUP_DELETE)) == 2 and "removed bh-builder" not in out, out + log
+    msg = next(l for l in out.splitlines() if l.startswith("could not delete group bh-builder, twice"))
+    assert ("is still open" in msg or "may still be open" in msg) and "not observed for the group" in msg, msg
+
+
+def test_a_group_delete_that_completed_anyway_counts_as_done(tmp_path):
+    rc, log, out, _, _ = run_teardown(tmp_path, gdeletes=["errdel"], **ORPHAN)
+    assert rc == 0 and len(lines(log, GROUP_DELETE)) == 1, out + log
+
+
+# ---- Security review round 1 F4: say what was observed and nothing more
+def test_the_notices_say_a_late_answer_still_deletes_the_account(tmp_path):
+    rc, log, out, _, _ = ours(tmp_path, extra=FAST)
+    line = next(l for l in out.splitlines() if ADMIN_PROMPT in l)
+    assert "Allow" in line and "after this command ends" in line, line
+
+
+def test_the_disclosures_name_the_administer_prompt_and_what_is_unknown_about_it():
+    from borrowed_hands_helper._shared import ROOT
+    for doc in ("README.md", "borrowed-hands/README.md", "docs/QUICKSTART.md"):
+        flat = " ".join((ROOT / doc).read_text().split())
+        assert "administer your computer" in flat, doc
+    quick = " ".join((ROOT / "docs/QUICKSTART.md").read_text().split())
+    assert "setup says it before creating the account" not in quick           # creating it was never seen to ask
+    assert "goes to the terminal app" in quick and "how long it lasts" in quick and "not established" in quick
+
+
+def test_a_long_wait_reminds_the_user_about_the_prompt(tmp_path):
+    rc, log, out, _, _ = ours(tmp_path, extra=FAST, deletes=["hang", "ok"])
+    reminders = [l for l in out.splitlines() if l.startswith("still waiting")]
+    assert rc == 0 and len(reminders) == 1, out                       # every 30 s of the 50 s limit
+    assert ADMIN_PROMPT in reminders[0] and "Allow" in reminders[0], reminders
+    rc, log, out, _, _ = ours(tmp_path / "quick", extra=FAST)
+    assert rc == 0 and "still waiting" not in out, out
+
+
+def test_a_failed_read_of_our_user_keeps_the_dispatcher_for_the_rerun(tmp_path):
+    # Security review round 1 F7: the account is kept, so the rerun must be able to sweep: never strand it without bh-dispatch
+    rc, log, out, home, prefix = run_teardown(tmp_path, users=[("bh-builder", OURS_USER)],
+                                              groups=[("bh-builder", "470")], home_stat="Directory:470:470",
+                                              extra=READ_FAILS)
+    assert rc == 1 and "could not inspect" in out, out + log
+    assert f"rm -rf {prefix}" not in log and f"rm -rf {home}" not in log, log
+
+
+def test_running_the_teardown_by_hand_is_documented_as_for_a_stopped_install():
+    # Security review round 1 F8: the bare script neither removes the sudo rule nor stops the helper; bh uninstall does both first
+    from borrowed_hands_helper._shared import ROOT
+    flat = " ".join((ROOT / "docs/SANDBOX.md").read_text().split())
+    assert "only for a stopped install" in flat and "SSH" in flat and "not observed" in flat
+    assert "bh uninstall" in SCRIPT.read_text().splitlines()[2]
+
+
+# ---- Security review round 1 test gaps (M18, M23): a late completion on the second attempt counts; a denial keeps everything
+@pytest.mark.parametrize("deletes", [["hang", "hangdel"], ["denied", "errdel"]])
+def test_a_delete_that_completes_on_the_retry_counts_as_done(tmp_path, deletes):
+    rc, log, out, home, prefix = ours(tmp_path, extra=FAST, deletes=deletes)
+    assert rc == 0 and len(lines(log, USER_DELETE)) == 2 and "no longer listed" in out, out + log
+    assert f"rm -rf {home}" in log and f"rm -rf {prefix}" in log
+
+
+def test_a_denied_prompt_keeps_the_group_home_and_dispatcher(tmp_path):
+    rc, log, out, home, prefix = ours(tmp_path, extra=FAST, deletes=["denied", "denied"])
+    assert rc == 1 and GROUP_DELETE not in log and f"rm -rf {home}" not in log and f"rm -rf {prefix}" not in log, log
+
+
+# ---- Security review round 2 N1: the account-gone branch acts only on a positive "not found" for the account, not on a listing
+# that merely omits it (never seen with the real dscl, but nothing else vouches for it)
+def test_a_listing_that_omits_an_existing_account_removes_nothing(tmp_path):
+    rc, log, out, home, prefix = run_teardown(tmp_path, users=[("bh-builder", OURS_USER)], listhide=True,
+                                              folders=REAL_SKELETON, full=TI_OK, **ORPHAN)
+    assert rc == 1 and "not confirmed" in out, out + log
+    for step in ("pkill", "pgrep", "launchctl bootout user/470", GROUP_DELETE, CACHES):
+        assert step not in log, (step, log)
+    assert f"rm -rf {home}" not in log and f"rm -rf {prefix}" not in log, log
+
+
+def test_a_read_that_fails_otherwise_is_not_absence_in_the_account_gone_branch(tmp_path):
+    rc, log, out, home, prefix = run_teardown(tmp_path, folders=REAL_SKELETON, full=TI_OK,
+                                              **{**ORPHAN, "extra": FAST + "\n" + READ_FAILS})
+    assert rc == 1 and "not confirmed" in out, out + log
+    assert "pkill" not in log and f"rm -rf {home}" not in log and f"rm -rf {prefix}" not in log, log
+
+
+
+def test_exit_3_only_when_everything_else_was_removed(tmp_path):
+    # Security review round 2 N7 (T08): folders not clean AND the group delete failing is a plain failure (exit 1), not exit 3
+    rc, log, out, _, _ = run_teardown(tmp_path, folders={**REAL_SKELETON, f"{SKEL}/C/x": "Regular File:470:0"},
+                                      full=TI_OK, gdeletes=["err", "err"], **ORPHAN)
+    assert rc == 1 and "could not delete group bh-builder, twice" in out, out + log
+
+
+
+# ---- Security review round 2 N8: wording that claimed more than the run saw
+@pytest.mark.parametrize("deletes,state", [(["hang", "hang"], "is still open"), (["err", "err"], "may still be open"),
+                                           (["denied", "denied"], "may still be open")])
+def test_the_failure_says_the_prompt_is_open_only_after_a_timeout(tmp_path, deletes, state):
+    rc, log, out, _, _ = ours(tmp_path, extra=FAST, deletes=deletes)
+    msg = next(l for l in out.splitlines() if l.startswith("could not delete user bh-builder, twice"))
+    assert rc == 1 and state in msg, msg
+    if state == "may still be open":
+        assert "That prompt is still open" not in msg, msg
+
+
+def test_the_notice_before_a_lone_group_delete_names_the_group(tmp_path):
+    rc, log, out, _, _ = run_teardown(tmp_path, **ORPHAN)
+    line = next(l for l in out.splitlines() if ADMIN_PROMPT in l)
+    assert rc == 0 and "group" in line and "account" not in line, line
+
+
+def test_no_open_prompt_is_mentioned_when_no_delete_was_tried(tmp_path):
+    rc, log, out, _, _ = ours(tmp_path, extra=FAST, pgreps=["found"] * 30)
+    assert rc == 1 and USER_DELETE not in log and "open prompt" not in out and "kept user bh-builder" in out, out
+
+
+def test_sandbox_md_describes_both_branches_of_the_by_uid_stop():
+    from borrowed_hands_helper._shared import ROOT
+    flat = " ".join((ROOT / "docs/SANDBOX.md").read_text().split())
+    assert "already gone" in flat and "dscl . -read" in flat
+
+
+def test_quickstart_keeps_the_two_late_deletes_apart():
+    from borrowed_hands_helper._shared import ROOT
+    flat = " ".join((ROOT / "docs/QUICKSTART.md").read_text().split())
+    assert "637 seconds and 947 seconds after the request, long after the command had exited" not in flat
+    assert "947 seconds" in flat and "637 seconds" in flat
+
+
+def test_the_known_limits_are_documented():
+    # Security review round 2 N3, N6, N9: documented, not fixed
+    from borrowed_hands_helper._shared import ROOT
+    flat = " ".join((ROOT / "docs/SANDBOX.md").read_text().split())
+    assert "only the local directory" in flat and "network directory" in flat                       # N3
+    assert "Uninstalled and verified" in flat and "exit 3" in flat                                  # N6
+    assert "Full Disk Access" in flat and "inferred" in flat                                        # N9
+    head = " ".join(SCRIPT.read_text().splitlines()[:20])
+    assert "only the local directory" in head                                                       # N3
